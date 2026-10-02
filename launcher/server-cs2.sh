@@ -1577,6 +1577,9 @@ start_server() {
         warn "Shared plugin registry is invalid; skipping shared plugin sync."
     fi
 
+    # exclusive admin plugins: root + admin list are copied into this server
+    admin_on_start "$S_PATH"
+
     gdir="$S_PATH${GAMEREL:+/$GAMEREL}"
     [[ -x $gdir/cs2.sh ]] || { err "Launcher not executable: $gdir/cs2.sh"; return 1; }
 
@@ -2444,7 +2447,7 @@ maintenance_menu() {
 
 # ------------------------------- Main menu -----------------------------------
 main_menu() {
-    local choice
+    local choice admin_on=0
     while :; do
         clear_screen
         dsep
@@ -2465,7 +2468,8 @@ main_menu() {
         echo "11) Server Console"
         echo "12) Log Viewer"
         echo "13) Maintenance"
-        echo "14) Exit"
+        admin_on=0; admin_available && admin_on=1
+        if ((admin_on)); then echo "14) Admin"; echo "15) Exit"; else echo "14) Exit"; fi
         echo
         read -r -p "Select: " choice || exit 0
         case "$(trim "$choice")" in
@@ -2482,7 +2486,8 @@ main_menu() {
             11) console_menu ;;
             12) logs_ui;          pause ;;
             13) maintenance_menu ;;
-            14) clear_screen; echo "Goodbye."; exit 0 ;;
+            14) if ((admin_on)); then admin_menu; else clear_screen; echo "Goodbye."; exit 0; fi ;;
+            15) if ((admin_on)); then clear_screen; echo "Goodbye."; exit 0; else err "Invalid option."; sleep 1; fi ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -4292,6 +4297,394 @@ launcher_settings_ui() {
             4) info "To change the CS2 folder run the setup wizard again (option 5)."; sleep 2 ;;
             5) confirm_yn "Run the setup wizard again? Existing servers are kept. [y/N]: " n && { run_setup_wizard; } ;;
             6|q|Q) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+#  ADMIN MANAGEMENT  (exclusive CS2Nexus plugins that have an admin section)
+#  The "Admin" entry of the main menu only appears when such a plugin is
+#  installed (ServerCommands, or any shared plugin shipping a nexus.json with
+#  "admin": true). The master list is BASE/<csgo>/addons/counterstrikesharp/
+#  configs/admins.json (the file the plugin itself edits); the launcher copies
+#  it into every server. The root admin (SteamID asked on first use) always
+#  gets every permission on every server.
+# =============================================================================
+readonly -a NEXUS_ADMIN_PLUGINS=("ServerCommands")
+readonly -a ADMIN_FLAG_LIST=(rr rs start end endwarmup startwarmup gag ungag addcash bh casual comp dm map spectate ff t hs votekick admincmd addadmin adminsp)
+readonly ADMIN_ROOT_FILE="$STATE_DIR/admin-root"
+readonly ADMIN_IMMUNITY=50
+readonly ADMIN_ROOT_IMMUNITY=100
+STEAMID64=""; ROOT_ID=""; ROOT_NAME=""; CHOSEN_FLAGS="[]"; PICK_ADMIN=""
+
+admin_available() {
+    local n m
+    ((SHARED_OK)) || return 1
+    for n in "${NEXUS_ADMIN_PLUGINS[@]}"; do
+        if jq -e --arg n "$n" 'any(.[]; type=="object" and .name == $n)' "$SHARED_DB" >/dev/null 2>&1 \
+            && [[ -e $SHARED_ADDONS/counterstrikesharp/plugins/$n ]]; then return 0; fi
+    done
+    for m in "$SHARED_ADDONS"/counterstrikesharp/plugins/*/nexus.json; do
+        [[ -f $m ]] || continue
+        jq -e '(.admin == true) or ((.admin | type) == "object")' "$m" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+admin_base_cfg()   { printf '%s/%s/addons/counterstrikesharp/configs' "$BASE" "$CSGOREL"; }
+admin_server_cfg() { printf '%s/%s/addons/counterstrikesharp/configs' "$1" "$CSGOREL"; }
+admin_base_file()  { printf '%s/admins.json' "$(admin_base_cfg)"; }
+
+# every admins.json the launcher maintains: the base copy first, then each server
+admin_files() {
+    local p slug
+    admin_base_file; echo
+    while IFS=$'\t' read -r p slug; do
+        safe_server_path "$p" "$slug" || continue
+        [[ -d $p/$CSGOREL ]] || continue
+        printf '%s/admins.json\n' "$(admin_server_cfg "$p")"
+    done < <(jq -r '.[] | [.path, .slug] | @tsv' "$DB")
+}
+
+# SteamID64, STEAM_0:Y:Z or [U:1:N]  ->  STEAMID64
+parse_steamid() {
+    local v y z
+    v=$(trim "$1"); STEAMID64=""
+    if [[ $v =~ ^7656119[0-9]{10}$ ]]; then STEAMID64=$v
+    elif [[ $v =~ ^STEAM_[0-5]:([01]):([0-9]{1,10})$ ]]; then
+        y=${BASH_REMATCH[1]}; z=${BASH_REMATCH[2]}
+        STEAMID64=$((76561197960265728 + 10#$z * 2 + y))
+    elif [[ $v =~ ^\[U:1:([0-9]{1,10})\]$ ]]; then
+        STEAMID64=$((76561197960265728 + 10#${BASH_REMATCH[1]}))
+    else return 1; fi
+}
+
+admin_full_flags() {
+    local f
+    { printf '@css/root\n'; for f in "${ADMIN_FLAG_LIST[@]}"; do printf '@nepentii/%s\n' "$f"; done; } | jq -R . | jq -sc .
+}
+
+# admin_edit <file> <jq args... filter>: atomic edit of a JSON OBJECT file
+admin_edit() {
+    local file=$1 dir tmp rc=0; shift
+    dir=$(dirname -- "$file")
+    if [[ ! -d $dir ]]; then
+        mkdir -p -- "$dir" && chown "$CS2_USER:$CS2_GROUP" -- "$dir" || { err "Cannot create $dir"; return 1; }
+    fi
+    if [[ ! -f $file ]]; then
+        echo '{}' >"$file" && chown "$CS2_USER:$CS2_GROUP" -- "$file" || { err "Cannot create $file"; return 1; }
+    fi
+    if ! jq -e 'type=="object"' "$file" >/dev/null 2>&1; then
+        err "$file is not a valid JSON object; refusing to modify it."; return 1
+    fi
+    [[ $file == "$(admin_base_file)" ]] && backup_json "$file"
+    tmp=$(mktemp "$dir/.admins.XXXXXX") || { err "mktemp failed"; return 1; }
+    if jq "$@" "$file" >"$tmp" && jq -e 'type=="object"' "$tmp" >/dev/null 2>&1; then
+        chmod 644 "$tmp"; chown "$CS2_USER:$CS2_GROUP" -- "$tmp"
+        mv -f -- "$tmp" "$file" || rc=1
+    else rc=1; fi
+    if ((rc)); then rm -f -- "$tmp"; err "Failed to update $file."; fi
+    return $rc
+}
+
+# admin_put <name> <steamid64> <flags-json> <immunity>: add/replace on base + all servers
+admin_put() {
+    local f rc=0
+    lock_ops 30 || return 1
+    while IFS= read -r f; do
+        admin_edit "$f" --arg n "$1" --arg i "$2" --argjson f "$3" --argjson m "$4" \
+            'with_entries(select(((.value.identity? // "") != $i) or .key == $n)) | .[$n] = {identity:$i, immunity:$m, flags:$f}' || rc=1
+    done < <(admin_files)
+    unlock_ops
+    return $rc
+}
+
+admin_del() {   # <name>
+    local f rc=0
+    lock_ops 30 || return 1
+    while IFS= read -r f; do
+        [[ -f $f ]] || continue
+        admin_edit "$f" --arg n "$1" 'del(.[$n])' || rc=1
+    done < <(admin_files)
+    unlock_ops
+    return $rc
+}
+
+admin_root_load() {
+    ROOT_ID=""; ROOT_NAME=""
+    [[ -s $ADMIN_ROOT_FILE ]] || return 1
+    IFS=$'\t' read -r ROOT_ID ROOT_NAME <"$ADMIN_ROOT_FILE"
+    [[ $ROOT_ID =~ ^7656119[0-9]{10}$ && $ROOT_NAME =~ ^[A-Za-z0-9_.-]{1,32}$ ]]
+}
+
+# make sure the root admin exists with every permission in the base file
+admin_ensure_root_entry() {
+    admin_edit "$(admin_base_file)" --arg n "$ROOT_NAME" --arg i "$ROOT_ID" \
+        --argjson f "$(admin_full_flags)" --argjson m "$ADMIN_ROOT_IMMUNITY" \
+        '(if any(.[]; (.identity? // "") == $i) then . else .[$n] = {identity:$i, immunity:$m, flags:[]} end)
+         | with_entries(if (.value.identity? // "") == $i then .value.flags = $f | .value.immunity = $m else . end)'
+}
+
+# merge the base list into every server (base wins on the same name)
+admin_push_all() {
+    local base f rc=0
+    base=$(admin_base_file)
+    lock_ops 30 || return 1
+    admin_ensure_root_entry || rc=1
+    while IFS= read -r f; do
+        [[ $f == "$base" ]] && continue
+        admin_edit "$f" --slurpfile b "$base" '. * $b[0]' || rc=1
+    done < <(admin_files)
+    unlock_ops
+    return $rc
+}
+
+# used by start_server: every server (also new ones) gets the admin list when it starts
+admin_on_start() {   # <server path>
+    local srv=$1 base f
+    admin_available || return 0
+    admin_root_load || return 0
+    need_layout || return 0
+    lock_ops 30 || return 0
+    base=$(admin_base_file)
+    f="$(admin_server_cfg "$srv")/admins.json"
+    admin_ensure_root_entry >/dev/null 2>&1
+    admin_edit "$f" --slurpfile b "$base" '. * $b[0]' >/dev/null 2>&1
+    unlock_ops
+    return 0
+}
+
+admin_reload_running() {
+    local id n cnt=0
+    while IFS= read -r id; do
+        load_server "$id" || continue
+        is_running "$id" || continue
+        console_send "$id" "css_reloadadmins" >/dev/null 2>&1
+        for n in "${NEXUS_ADMIN_PLUGINS[@]}"; do console_send "$id" "css_plugins reload $n" >/dev/null 2>&1; done
+        cnt=$((cnt + 1))
+    done < <(jq -r '.[].id' "$DB")
+    ((cnt > 0)) && ok "Reload requested on $cnt running server(s)."
+    return 0
+}
+
+admin_set_root() {   # <steamid64> <name>
+    lock_ops 30 || return 1
+    mkdir -p -- "$STATE_DIR"
+    printf '%s\t%s\n' "$1" "$2" >"$ADMIN_ROOT_FILE" || { err "Cannot write $ADMIN_ROOT_FILE"; unlock_ops; return 1; }
+    chmod 600 "$ADMIN_ROOT_FILE"
+    ROOT_ID=$1; ROOT_NAME=$2
+    if admin_push_all; then ok "$2 ($1) is now root admin on all servers."
+    else warn "Root admin saved, but some files could not be updated (see above)."; fi
+    unlock_ops
+    admin_reload_running
+}
+
+admin_ask_identity() {   # -> STEAMID64
+    while :; do
+        ask "SteamID (SteamID64, STEAM_0:x:y or [U:1:n])" || return 1
+        parse_steamid "$ANSWER" && return 0
+        err "Not a valid SteamID. Example: 76561198000000000"
+    done
+}
+
+admin_ask_name() {   # <default> -> ANSWER
+    while :; do
+        ask "Admin name (letters, digits, _ . -)" "${1:-}" || return 1
+        [[ $ANSWER =~ ^[A-Za-z0-9_.-]{1,32}$ ]] && return 0
+        err "Use 1-32 characters: letters, digits, _ . -"
+    done
+}
+
+admin_first_setup() {
+    header "ADMIN SETUP - FIRST ROOT ADMIN"
+    echo "An admin plugin is installed. Enter the SteamID of the person who will be"
+    echo "ROOT admin: full access to every command on ALL servers."
+    echo "(enter q to cancel)"; echo
+    admin_ask_identity || return 1
+    local sid=$STEAMID64
+    admin_ask_name "Root" || return 1
+    local name=$ANSWER
+    echo; sep
+    echo "  Root admin : $name"
+    echo "  SteamID64  : $sid"
+    echo "  Access     : all commands, all servers"
+    sep
+    confirm_yn "Create this root admin? [Y/n]: " y || return 1
+    admin_set_root "$sid" "$name"
+}
+
+admin_list_ui() {
+    local base n id fl im mark
+    base=$(admin_base_file)
+    header "ADMINS"
+    if [[ ! -f $base ]] || [[ $(jq 'length' "$base" 2>/dev/null) == 0 ]]; then warn "No admins yet."; return; fi
+    printf '%s%-24s %-19s %-6s %-9s%s\n' "$BOLD" Name SteamID64 Flags Immunity "$RESET"
+    sep
+    while IFS=$'\t' read -r n id fl im; do
+        mark=""; [[ $id == "$ROOT_ID" ]] && mark="  (root)"
+        printf '%-24.24s %-19s %-6s %-9s%s\n' "$n" "$id" "$fl" "$im" "$mark"
+    done < <(jq -r 'to_entries[] | select(.value|type=="object") | [.key, (.value.identity // "-"), ((.value.flags // [])|length), (.value.immunity // 0)] | @tsv' "$base")
+}
+
+admin_pick() {   # -> PICK_ADMIN
+    local base i=0 n
+    local -a names
+    base=$(admin_base_file); PICK_ADMIN=""
+    mapfile -t names < <(jq -r 'to_entries[] | select(.value|type=="object") | .key' "$base" 2>/dev/null)
+    if ((${#names[@]} == 0)); then warn "No admins yet."; return 1; fi
+    for n in "${names[@]}"; do i=$((i + 1)); printf '  %s) %s\n' "$i" "$n"; done
+    echo
+    ask "Admin number (q = cancel)" || return 1
+    if ! [[ $ANSWER =~ ^[0-9]+$ ]] || ((10#$ANSWER < 1 || 10#$ANSWER > ${#names[@]})); then err "Invalid selection."; return 1; fi
+    PICK_ADMIN=${names[$((10#$ANSWER - 1))]}
+}
+
+# interactive permission toggler -> CHOSEN_FLAGS (json array); returns 1 if cancelled
+admin_choose_flags() {   # <initial flags json>
+    local init=$1 c f i tok k
+    local -A have=()
+    local -a extra=() out=()
+    while IFS= read -r f; do
+        [[ -n $f ]] || continue
+        if [[ $f == "@css/root" ]]; then have[root]=1
+        elif [[ $f == @nepentii/* && " ${ADMIN_FLAG_LIST[*]} " == *" ${f#@nepentii/} "* ]]; then have[${f#@nepentii/}]=1
+        else extra+=("$f"); fi
+    done < <(jq -r '.[]' <<<"$init" 2>/dev/null)
+    while :; do
+        echo; i=0
+        for f in "${ADMIN_FLAG_LIST[@]}"; do
+            i=$((i + 1))
+            printf '  %2s) [%s] @nepentii/%s\n' "$i" "$([[ -n ${have[$f]:-} ]] && echo x || echo ' ')" "$f"
+        done
+        printf '  %2s) [%s] @css/root  (everything)\n' "$((i + 1))" "$([[ -n ${have[root]:-} ]] && echo x || echo ' ')"
+        echo "  Type numbers to toggle (e.g. 1 3 5), a = all, n = none, s = save, q = cancel"
+        read -r -p "Select: " c || exit 0
+        c=$(trim "$c")
+        case $c in
+            s|S) break ;;
+            q|Q) return 1 ;;
+            a|A) for f in "${ADMIN_FLAG_LIST[@]}"; do have[$f]=1; done; have[root]=1; continue ;;
+            n|N) have=(); continue ;;
+        esac
+        for tok in ${c//,/ }; do
+            if [[ $tok =~ ^[0-9]+$ ]] && ((10#$tok >= 1 && 10#$tok <= i + 1)); then
+                if ((10#$tok == i + 1)); then k=root; else k=${ADMIN_FLAG_LIST[$((10#$tok - 1))]}; fi
+                if [[ -n ${have[$k]:-} ]]; then unset "have[$k]"; else have[$k]=1; fi
+            fi
+        done
+    done
+    out=("${extra[@]}")
+    for k in "${!have[@]}"; do
+        if [[ $k == root ]]; then out+=("@css/root"); else out+=("@nepentii/$k"); fi
+    done
+    CHOSEN_FLAGS=$(printf '%s\n' "${out[@]}" | jq -R 'select(length>0)' | jq -sc .)
+    return 0
+}
+
+admin_add_ui() {
+    local base sid name flags
+    base=$(admin_base_file)
+    header "ADD ADMIN"
+    echo "(enter q to cancel)"; echo
+    admin_ask_identity || { info "Cancelled."; return; }
+    sid=$STEAMID64
+    if [[ -f $base ]] && jq -e --arg i "$sid" 'any(.[]; (.identity? // "") == $i)' "$base" >/dev/null 2>&1; then
+        warn "This SteamID is already an admin. Use 'Edit admin permissions'."; return
+    fi
+    while :; do
+        admin_ask_name "" || { info "Cancelled."; return; }
+        name=$ANSWER
+        if [[ -f $base ]] && jq -e --arg n "$name" 'has($n)' "$base" >/dev/null 2>&1; then err "That name is already used."; continue; fi
+        break
+    done
+    echo
+    echo "  1) Full access (all commands)"
+    echo "  2) Choose the commands"
+    ask "Choice" 1 || { info "Cancelled."; return; }
+    case $ANSWER in
+        1) flags=$(admin_full_flags) ;;
+        2) admin_choose_flags "[]" || { info "Cancelled."; return; }; flags=$CHOSEN_FLAGS ;;
+        *) err "Invalid choice."; return ;;
+    esac
+    if admin_put "$name" "$sid" "$flags" "$ADMIN_IMMUNITY"; then
+        ok "Admin '$name' ($sid) added on all servers."
+        admin_reload_running
+    fi
+}
+
+admin_edit_ui() {
+    local base id im cur
+    base=$(admin_base_file)
+    header "EDIT ADMIN PERMISSIONS"
+    admin_pick || return
+    id=$(jq -r --arg n "$PICK_ADMIN" '.[$n].identity // empty' "$base")
+    im=$(jq -r --arg n "$PICK_ADMIN" '.[$n].immunity // empty' "$base")
+    [[ $id =~ ^7656119[0-9]{10}$ ]] || { err "This entry has no valid identity."; return; }
+    if [[ $id == "$ROOT_ID" ]]; then warn "The root admin is protected and always has every permission."; return; fi
+    cur=$(jq -c --arg n "$PICK_ADMIN" '.[$n].flags // []' "$base")
+    admin_choose_flags "$cur" || { info "Cancelled."; return; }
+    if admin_put "$PICK_ADMIN" "$id" "$CHOSEN_FLAGS" "${im:-$ADMIN_IMMUNITY}"; then
+        ok "Permissions of '$PICK_ADMIN' saved on all servers."
+        admin_reload_running
+    fi
+}
+
+admin_remove_ui() {
+    local base id
+    base=$(admin_base_file)
+    header "REMOVE ADMIN"
+    admin_pick || return
+    id=$(jq -r --arg n "$PICK_ADMIN" '.[$n].identity // empty' "$base")
+    if [[ $id == "$ROOT_ID" ]]; then err "The root admin cannot be removed. Use 'Change root admin' first."; return; fi
+    confirm_yn "Remove admin '$PICK_ADMIN' from ALL servers? [y/N]: " n || { info "Cancelled."; return; }
+    if admin_del "$PICK_ADMIN"; then ok "Admin '$PICK_ADMIN' removed."; admin_reload_running; fi
+}
+
+admin_change_root_ui() {
+    header "CHANGE ROOT ADMIN"
+    printf '  Current root: %s (%s)\n\n' "$ROOT_NAME" "$ROOT_ID"
+    echo "(enter q to cancel)"; echo
+    admin_ask_identity || { info "Cancelled."; return; }
+    local sid=$STEAMID64
+    admin_ask_name "Root" || { info "Cancelled."; return; }
+    local name=$ANSWER
+    info "The previous root stays in the list as a normal admin; remove it if you want."
+    confirm_yn "Make $name ($sid) the root admin? [y/N]: " n || { info "Cancelled."; return; }
+    admin_set_root "$sid" "$name"
+}
+
+admin_menu() {
+    local c
+    need_layout || return
+    if ! admin_root_load; then
+        admin_first_setup || { info "Admin setup cancelled."; sleep 1; return; }
+        pause
+    fi
+    while :; do
+        header "ADMIN"
+        printf '  Root admin : %s (%s)\n' "$ROOT_NAME" "$ROOT_ID"
+        [[ $BASE == /opt/cs2 ]] || warn "ServerCommands uses /opt/cs2 paths internally; BASE is $BASE."
+        echo
+        echo "  1) List admins"
+        echo "  2) Add admin"
+        echo "  3) Edit admin permissions"
+        echo "  4) Remove admin"
+        echo "  5) Change root admin"
+        echo "  6) Sync to all servers + reload"
+        echo "  7) Back"
+        echo
+        read -r -p "Select: " c || exit 0
+        case "$(trim "$c")" in
+            1) admin_list_ui;        pause ;;
+            2) admin_add_ui;         pause ;;
+            3) admin_edit_ui;        pause ;;
+            4) admin_remove_ui;      pause ;;
+            5) admin_change_root_ui; pause ;;
+            6) header "SYNC ADMINS"
+               if admin_push_all; then ok "Admin list synced to all servers."; admin_reload_running; fi
+               pause ;;
+            7|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
