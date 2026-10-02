@@ -68,6 +68,8 @@ EXTRA_PLUGIN_REPOS="Ayrton09/AstraSkins"
 GITHUB_TOKEN=""
 AUTOUPDATE=0
 UPDATE_ACTION="none"        # none | reload : what to do on running servers after a plugin update
+SETTINGS_DEFAULT_JSON='[{"id":0,"cvars":{},"features":{"team_balance":"off","force_pick_time":"off"},"launch":{"maxplayers":13,"map":"de_dust2","game_type":0,"game_mode":1},"custom":[],"plugins":{"mode":"all","local":[]}}]'
+PREFLIGHT_MODE=menu
 readonly STEAM_APPID=730
 readonly WATCHDOG_UNIT="cs2-watchdog"
 readonly WATCHDOG_MAX_RESTARTS=3
@@ -189,6 +191,39 @@ unlock_ops() {
 SHARED_OK=1
 AUTOSTART_OK=1
 
+# repair_json_array <file> <label> <empty-json>
+# Offers to repair a damaged registry (menu mode only). The damaged file is always
+# kept as <file>.broken-<time>; servers.json is never touched by this helper.
+repair_json_array() {
+    local f=$1 label=$2 empty=$3 cand="" ts tmp head
+    [[ $PREFLIGHT_MODE == menu ]] || return 1
+    [[ -f $f ]] || return 1
+    echo
+    warn "The $label is damaged (it is not a JSON array): $f"
+    head=$(head -c 160 -- "$f" 2>/dev/null | tr -d '\000-\010\013-\037' | tr '\n' ' ')
+    info "Start of the file: ${head:-<empty>}"
+    if [[ -z $(tr -d '[:space:]' <"$f" 2>/dev/null) ]]; then
+        info "The file is empty."
+    elif jq -e 'type=="object"' "$f" >/dev/null 2>&1; then
+        cand=$(jq -c '[.[] | select(type=="array")] | if length == 1 then .[0] else empty end' "$f" 2>/dev/null)
+        [[ -n $cand ]] && info "It is an object that wraps a list (for example {\"plugins\": [...]}); the list inside can be kept."
+    fi
+    if [[ -z $cand ]]; then
+        cand=$empty
+        info "It will be replaced by a fresh, empty registry."
+    fi
+    confirm_yn "Repair it now? A copy of the damaged file is kept next to it (.broken-...). [Y/n]: " y || return 1
+    ts=$(date +%Y%m%d-%H%M%S)
+    cp -p -- "$f" "$f.broken-$ts" || { err "Could not keep a copy of the damaged file."; return 1; }
+    tmp=$(mktemp "$f.XXXXXX") || return 1
+    printf '%s\n' "$cand" >"$tmp"
+    if ! jq -e 'type=="array"' "$tmp" >/dev/null 2>&1; then rm -f -- "$tmp"; err "Repair failed."; return 1; fi
+    chmod --reference="$f" -- "$tmp" 2>/dev/null
+    mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; err "Repair failed."; return 1; }
+    ok "Repaired. The damaged file was kept as $f.broken-$ts"
+    return 0
+}
+
 init_shared() {
     install -d -m 755 -- "$SHARED_DIR" "$BACKUP_DIR" "$STATE_DIR" \
         || { err "Cannot create $SHARED_DIR"; exit 1; }
@@ -207,8 +242,10 @@ init_shared() {
         chmod 644 "$SHARED_DB"
     fi
     if ! jq -e 'type=="array"' "$SHARED_DB" >/dev/null 2>&1; then
-        SHARED_OK=0
-        warn "$SHARED_DB is not a valid JSON array. Shared plugin features are disabled until it is fixed."
+        if ! repair_json_array "$SHARED_DB" "plugin registry" "[]"; then
+            SHARED_OK=0
+            warn "$SHARED_DB is not a valid JSON array. Plugin features are disabled until it is fixed."
+        fi
     fi
 
     if [[ ! -e $AUTOSTART_DB && ! -L $AUTOSTART_DB ]]; then
@@ -216,14 +253,17 @@ init_shared() {
         chmod 644 "$AUTOSTART_DB"
     fi
     if ! jq -e 'type=="array"' "$AUTOSTART_DB" >/dev/null 2>&1; then
-        AUTOSTART_OK=0
-        warn "$AUTOSTART_DB is not a valid JSON array. Autostart/watchdog features are disabled until it is fixed."
+        if ! repair_json_array "$AUTOSTART_DB" "autostart list" "[]"; then
+            AUTOSTART_OK=0
+            warn "$AUTOSTART_DB is not a valid JSON array. Autostart/watchdog features are disabled until it is fixed."
+        fi
     fi
 }
 
 # preflight [menu|cli]  - the single-instance lock is only taken for the menu
 preflight() {
     local mode=${1:-menu}
+    PREFLIGHT_MODE=$mode
     if [[ $EUID -ne 0 ]]; then
         err "This manager must be run as root (use: sudo $0)."
         exit 1
@@ -584,6 +624,7 @@ OPT_INCL_CSV="-"
 
 shared_db_ok() {
     ((SHARED_OK)) && return 0
+    if repair_json_array "$SHARED_DB" "plugin registry" "[]"; then SHARED_OK=1; return 0; fi
     err "Shared plugin registry ($SHARED_DB) is not a valid JSON array."
     err "Fix or restore it (backups: $BACKUP_DIR), then try again."
     return 1
@@ -2867,14 +2908,14 @@ settings_clone_default() {
 
 init_settings() {
     if [[ ! -e $SETTINGS_DB && ! -L $SETTINGS_DB ]]; then
-        cat >"$SETTINGS_DB" <<'EOF'
-[{"id":0,"cvars":{},"features":{"team_balance":"off","force_pick_time":"off"},"launch":{"maxplayers":13,"map":"de_dust2","game_type":0,"game_mode":1},"custom":[],"plugins":{"mode":"all","local":[]}}]
-EOF
+        printf '%s\n' "$SETTINGS_DEFAULT_JSON" >"$SETTINGS_DB"
         chmod 600 "$SETTINGS_DB"
     fi
     if ! jq -e 'type=="array"' "$SETTINGS_DB" >/dev/null 2>&1; then
-        SETTINGS_OK=0
-        warn "$SETTINGS_DB is not a valid JSON array. Server settings are disabled until it is fixed."
+        if ! repair_json_array "$SETTINGS_DB" "server settings file" "$SETTINGS_DEFAULT_JSON"; then
+            SETTINGS_OK=0
+            warn "$SETTINGS_DB is not a valid JSON array. Server settings are disabled until it is fixed."
+        fi
     fi
 }
 
@@ -3312,7 +3353,10 @@ settings_target_menu() {   # <id>
 
 settings_menu() {
     local c
-    ((SETTINGS_OK)) || { err "Settings file is invalid: $SETTINGS_DB"; pause; return; }
+    if ! ((SETTINGS_OK)); then
+        if repair_json_array "$SETTINGS_DB" "server settings file" "$SETTINGS_DEFAULT_JSON"; then SETTINGS_OK=1
+        else err "Settings file is invalid: $SETTINGS_DB"; pause; return; fi
+    fi
     while :; do
         header "SERVER SETTINGS"
         echo "  0) DEFAULT - applied to every newly created server"
