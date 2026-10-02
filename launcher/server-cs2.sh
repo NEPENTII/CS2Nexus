@@ -3050,21 +3050,17 @@ st_basics_ui() {   # <id>
     done
 }
 
-st_cfg_refresh() { if (($1 > 0)) && load_server "$1"; then write_server_cfg "$S_PATH" "$S_NAME" "$S_MAX" "$S_PORT" "$1" >/dev/null 2>&1; fi; return 0; }
-
-st_mode_ui() {   # <id>: game mode + round time + warmup
+st_mode_ui() {   # <id>: game mode + round time
     local id=$1 c gt gm v
     local -a presets=("Casual|0|0" "Competitive|0|1" "Wingman|0|2" "Arms Race|1|0" "Demolition|1|1" "Deathmatch|1|2")
     while :; do
-        header "GAME MODE, ROUND TIME & WARMUP"
+        header "GAME MODE & ROUND TIME"
         gt=$(launch_value "$id" game_type 0); gm=$(launch_value "$id" game_mode 1)
         printf '  Game mode  : game_type %s / game_mode %s\n' "$gt" "$gm"
-        printf '  Round time : %s minutes (mp_roundtime)\n' "$(st_get "$id" | jq -r '.cvars.mp_roundtime // "game default"')"
-        printf '  Warmup     : %s\n\n' "$(st_get "$id" | jq -r 'if .cvars.mp_do_warmup_period == "0" then "disabled" elif .cvars.mp_warmuptime then (.cvars.mp_warmuptime + " seconds") else "game default" end')"
+        printf '  Round time : %s minutes (mp_roundtime)\n\n' "$(st_get "$id" | jq -r '.cvars.mp_roundtime // "game default"')"
         echo "  1) Game mode (applies after a restart)"
         echo "  2) Round time (minutes per round)"
-        echo "  3) Warmup time (seconds before the match starts, 0 = no warmup)"
-        echo "  4) Back"
+        echo "  3) Back"
         echo
         read -r -p "Select: " c || exit 0
         case "$(trim "$c")" in
@@ -3083,21 +3079,8 @@ st_mode_ui() {   # <id>: game mode + round time + warmup
                 if ! awk -v x="$v" 'BEGIN{exit !(x >= 0.5 && x <= 60)}'; then err "Choose between 0.5 and 60."; sleep 1; continue; fi
                 st_update "$id" '.cvars.mp_roundtime = $v | .cvars.mp_roundtime_defuse = $v | .cvars.mp_roundtime_hostage = $v' --arg v "$v" >/dev/null \
                     && ok "Round time set to $v minutes (normal, defuse and hostage maps)."
-                st_cfg_refresh "$id"
                 sleep 1 ;;
-            3)
-                ask "Warmup time in seconds (0 = no warmup, max 3600)" "30" || continue
-                if ! [[ $ANSWER =~ ^[0-9]{1,4}$ ]] || ((10#$ANSWER > 3600)); then err "Enter a whole number between 0 and 3600."; sleep 1; continue; fi
-                v=$((10#$ANSWER))
-                if ((v == 0)); then
-                    st_update "$id" '.cvars.mp_do_warmup_period = "0" | .cvars.mp_warmuptime = "0"' >/dev/null && ok "Warmup disabled."
-                else
-                    st_update "$id" '.cvars.mp_do_warmup_period = "1" | .cvars.mp_warmuptime = $v' --arg v "$v" >/dev/null && ok "Warmup time set to $v seconds."
-                fi
-                st_cfg_refresh "$id"
-                ((id > 0)) && is_running "$id" && info "Use 'Apply now' in the settings menu to push it to the running server."
-                sleep 1 ;;
-            4|q|Q) return ;;
+            3|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -3285,7 +3268,7 @@ settings_target_menu() {   # <id>
         echo "  Saved: $(st_entry_summary "$id" 2>/dev/null)"
         echo
         echo "  1) Basics (name, port, client limit, start map$( ((id > 0)) && echo ', GSLT'))"
-        echo "  2) Game mode, round time & warmup"
+        echo "  2) Game mode & round time"
         echo "  3) Quick options (bunny hop, team rules, all talk, ...)"
         echo "  4) CFG settings (every cvar, by category)"
         echo "  5) Custom cfg lines"
