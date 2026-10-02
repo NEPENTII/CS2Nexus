@@ -1132,6 +1132,167 @@ import_plugin() {
     return 0
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =============================================================================
+#  BAN LIST  (per server: reads that server's own cfg/banned_user.cfg + banned_ip.cfg)
+# =============================================================================
+BAN_ROWS=()
+
+# bans_collect <server path>  -> BAN_ROWS: "kind<TAB>minutes<TAB>target"
+bans_collect() {
+    local cfgdir="$1/$CSGOREL/cfg" f line kind
+    BAN_ROWS=()
+    for f in banned_user.cfg banned_ip.cfg; do
+        [[ -f $cfgdir/$f ]] || continue
+        kind=ID; [[ $f == banned_ip.cfg ]] && kind=IP
+        while IFS= read -r line || [[ -n $line ]]; do
+            line=$(trim "${line%$'\r'}")
+            if [[ $line =~ ^ban(id|ip)[[:space:]]+([0-9.]+)[[:space:]]+([^[:space:]]+) ]]; then
+                BAN_ROWS+=("$kind"$'\t'"${BASH_REMATCH[2]}"$'\t'"${BASH_REMATCH[3]}")
+            fi
+        done <"$cfgdir/$f"
+    done
+}
+
+# ban_name_lookup <server path> <steamid>  -> last known name from this server's game logs
+ban_name_lookup() {
+    local logdir="$1/$CSGOREL/logs" id=$2 acc
+    if   [[ $id =~ ^7656119[0-9]{10}$ ]];   then acc=$((id - 76561197960265728))
+    elif [[ $id =~ ^\[U:1:([0-9]+)\]$ ]];   then acc=${BASH_REMATCH[1]}
+    else return 0; fi
+    cat -- "$logdir"/*.log 2>/dev/null \
+        | sed -nE "s/^L .*: \"(.*)<[0-9]+><\[U:1:$acc\]><[^>]*>\".*/\1/p" | tail -n 1
+}
+
+# bans_show <server id>
+bans_show() {
+    local id=$1 row kind mins target name when i=0
+    need_layout || return 1
+    load_server "$id" || return 1
+    if is_running "$id"; then
+        # make the running server write its in-memory bans to the cfg files
+        console_send "$id" "writeid" >/dev/null
+        console_send "$id" "writeip" >/dev/null
+        sleep 1
+    fi
+    bans_collect "$S_PATH"
+    echo; sep
+    printf '%sBanned players - %s%s   (this server only)\n' "$BOLD" "$S_NAME" "$RESET"
+    sep
+    if ((${#BAN_ROWS[@]} == 0)); then info "No banned players on this server."; return 0; fi
+    printf '%s%-4s %-5s %-22s %-24s %s%s\n' "$BOLD" "#" Type "SteamID / IP" "Last known name" Duration "$RESET"
+    for row in "${BAN_ROWS[@]}"; do
+        IFS=$'\t' read -r kind mins target <<<"$row"
+        i=$((i + 1))
+        name=""; [[ $kind == ID ]] && name=$(ban_name_lookup "$S_PATH" "$target")
+        [[ $mins == 0 ]] && when="permanent" || when="$mins min"
+        printf '%-4s %-5s %-22.22s %-24.24s %s\n' "$i" "$kind" "$target" "${name:--}" "$when" \
+            | tr -d '\000-\010\013-\037\177'
+    done
+    sep
+    echo "Total: ${#BAN_ROWS[@]}"
+}
+
+bans_list_ui() {
+    header "BAN LIST"
+    pick_server "Server ID (q = cancel): " || return
+    bans_show "$PICK_ID"
+}
+
+bans_unban_ui() {
+    header "UNBAN PLAYER"
+    pick_server "Server ID (q = cancel): " || return
+    local id=$PICK_ID target re='^[][A-Za-z0-9:._-]{3,64}$'
+    if ! is_running "$id"; then
+        err "$S_NAME is offline. Start it first (the unban is applied through the running server)."
+        return
+    fi
+    bans_show "$id"
+    ((${#BAN_ROWS[@]} == 0)) && return
+    echo
+    ask "SteamID or IP to unban (q = cancel)" || { info "Cancelled."; return; }
+    target=$ANSWER
+    if ! [[ $target =~ $re ]]; then err "Invalid SteamID / IP."; return; fi
+    if [[ $target =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        console_send "$id" "removeip $target" && console_send "$id" "writeip"
+    else
+        console_send "$id" "removeid $target" && console_send "$id" "writeid"
+    fi
+    ok "Unban command sent to $S_NAME only."
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ------------------------------- Shared plugin UI ----------------------------
 shared_add_ui() {
     header "ADD SHARED PLUGIN"
