@@ -578,6 +578,35 @@ seed_independent() {
     mkdir -p -- "$csgo_srv/logs" "$srv/logs" || return 1
 }
 
+# The CS2 game-mode configs (gamemode_competitive.cfg, gamemode_casual.cfg, ...) set
+# mp_roundtime, mp_warmuptime, mp_freezetime, ... AFTER server.cfg has run, so those values
+# would silently win. The same settings are therefore also written to the per-server
+# gamemode_<mode>_server.cfg override files (our own files; no stock file is replaced) and to
+# cs2nexus_settings.cfg, which "Apply now" executes on a running server.
+GM_FILES=(casual competitive competitive2v2 deathmatch armsrace demolition workshop custom)
+write_gamemode_overrides() {   # <server dir> <id>
+    local srv=$1 id=$2 dir lines g f
+    dir="$srv/$CSGOREL/cfg"
+    [[ -d $dir && ! -L $dir ]] || return 0
+    lines=$(settings_cfg_lines "$id" 2>/dev/null)
+    f="$dir/cs2nexus_settings.cfg"
+    [[ -L $f ]] && rm -f -- "$f"
+    { echo '// Written by CS2Nexus. Do not edit: use Server Settings.'; [[ -n $lines ]] && printf '%s\n' "$lines"; } >"$f"
+    chown "$CS2_USER:$CS2_GROUP" -- "$f" 2>/dev/null
+    for g in "${GM_FILES[@]}"; do
+        f="$dir/gamemode_${g}_server.cfg"
+        [[ -L $f ]] && continue
+        if [[ -f $f ]]; then sed -i '/^\/\/ BEGIN CS2NEXUS-GAMEMODE$/,/^\/\/ END CS2NEXUS-GAMEMODE$/d' "$f"; fi
+        if [[ -n $lines ]]; then
+            { echo '// BEGIN CS2NEXUS-GAMEMODE'; printf '%s\n' "$lines"; echo '// END CS2NEXUS-GAMEMODE'; } >>"$f"
+            chown "$CS2_USER:$CS2_GROUP" -- "$f" 2>/dev/null
+        elif [[ -f $f && ! -s $f ]]; then
+            rm -f -- "$f"
+        fi
+    done
+    return 0
+}
+
 write_server_cfg() {
     local srv=$1 name=$2 maxp=$3 port=$4 id=${5:-} gslt="" cfg
     need_layout || return 1
@@ -602,6 +631,7 @@ write_server_cfg() {
     } >>"$cfg" || { err "Cannot append to $cfg"; return 1; }
     chown "$CS2_USER:$CS2_GROUP" -- "$cfg" || return 1
     [[ -n $gslt ]] && chmod 640 -- "$cfg"
+    [[ -n $id ]] && write_gamemode_overrides "$srv" "$id"
 
     if sed '/^\/\/ BEGIN CS2-MANAGER$/,/^\/\/ END CS2-MANAGER$/d' "$cfg" | grep -Eq '^[[:space:]]*sv_setsteamaccount'; then
         warn "server.cfg contains a Steam GSLT token (sv_setsteamaccount) outside the managed block."
@@ -2732,43 +2762,43 @@ sv_talk_enemy_dead|Voice & Chat|b|0|Dead players can talk to enemy team
 sv_talk_enemy_living|Voice & Chat|b|0|Living players can talk to enemy team
 sv_deadtalk|Voice & Chat|b|0|Dead players can talk to living players
 sv_voiceenable|Voice & Chat|b|1|Enable voice chat
-sv_allow_votes|Voice & Chat|b|1|Allow player votes
-sv_vote_issue_kick_allowed|Voice & Chat|b|1|Allow vote-kick
-sv_vote_issue_changelevel_allowed|Voice & Chat|b|1|Allow vote to change map
-sv_vote_issue_restart_game_allowed|Voice & Chat|b|0|Allow vote to restart the game
-sv_vote_issue_scramble_teams_allowed|Voice & Chat|b|0|Allow vote to scramble teams
+sv_allow_votes|Votes|b|1|Allow player votes
+sv_vote_issue_kick_allowed|Votes|b|1|Allow vote-kick
+sv_vote_issue_changelevel_allowed|Votes|b|1|Allow vote to change map
+sv_vote_issue_restart_game_allowed|Votes|b|0|Allow vote to restart the game
+sv_vote_issue_scramble_teams_allowed|Votes|b|0|Allow vote to scramble teams
 mp_roundtime|Rounds & Match|f|1.92|Minutes per round
 mp_roundtime_defuse|Rounds & Match|f|1.92|Minutes per round on defuse maps
 mp_roundtime_hostage|Rounds & Match|f|1.92|Minutes per round on hostage maps
 mp_freezetime|Rounds & Match|i|15|Freeze time at round start (seconds)
-mp_buytime|Rounds & Match|i|20|Buy time (seconds)
-mp_buy_anywhere|Rounds & Match|e:0,1,2,3|0|Buy anywhere (0 off, 1 both, 2 T, 3 CT)
+mp_buytime|Buy & Shop|i|20|Buy time (seconds)
+mp_buy_anywhere|Buy & Shop|e:0,1,2,3|0|Buy anywhere (0 off, 1 both, 2 T, 3 CT)
 mp_maxrounds|Rounds & Match|i|24|Rounds per match (0 = unlimited)
 mp_timelimit|Rounds & Match|i|0|Map time limit in minutes (0 = none)
 mp_halftime|Rounds & Match|b|1|Switch sides at halftime
 mp_match_can_clinch|Rounds & Match|b|1|End match early when a team clinches
-mp_do_warmup_period|Rounds & Match|b|1|Enable warmup
-mp_warmuptime|Rounds & Match|i|30|Warmup length (seconds)
-mp_warmup_pausetimer|Rounds & Match|b|0|Pause the warmup timer
-mp_startmoney|Rounds & Match|i|800|Starting money
-mp_maxmoney|Rounds & Match|i|16000|Maximum money
-mp_afterroundmoney|Rounds & Match|i|0|Money given to everyone after a round
-mp_c4timer|Rounds & Match|i|40|Bomb timer (seconds)
+mp_do_warmup_period|Warmup|b|1|Enable warmup
+mp_warmuptime|Warmup|i|30|Warmup length (seconds)
+mp_warmup_pausetimer|Warmup|b|0|Pause the warmup timer
+mp_startmoney|Economy & Armor|i|800|Starting money
+mp_maxmoney|Economy & Armor|i|16000|Maximum money
+mp_afterroundmoney|Economy & Armor|i|0|Money given to everyone after a round
+mp_c4timer|Drops & C4|i|40|Bomb timer (seconds)
 mp_round_restart_delay|Rounds & Match|i|7|Delay before the next round (seconds)
 mp_win_panel_display_time|Rounds & Match|i|3|Win panel display time (seconds)
 mp_ignore_round_win_conditions|Rounds & Match|b|0|Rounds never end by win conditions
 mp_overtime_enable|Rounds & Match|b|0|Enable overtime
 mp_overtime_maxrounds|Rounds & Match|i|6|Overtime rounds
 mp_overtime_startmoney|Rounds & Match|i|10000|Overtime starting money
-mp_respawn_on_death_t|Rounds & Match|b|0|Terrorists respawn after death
-mp_respawn_on_death_ct|Rounds & Match|b|0|Counter-terrorists respawn after death
-mp_free_armor|Rounds & Match|e:0,1,2|0|Free armor (1 kevlar, 2 kevlar+helmet)
-mp_defuser_allocation|Rounds & Match|e:0,1,2|0|Free defuse kits (1 random CT, 2 all CT)
-mp_death_drop_gun|Rounds & Match|e:0,1,2|1|Drop weapon on death (0 none, 1 best, 2 current)
-mp_death_drop_grenade|Rounds & Match|e:0,1,2,3|2|Drop grenades on death (0 none, 1 best, 2 current, 3 all)
-mp_weapons_allow_map_placed|Rounds & Match|b|1|Allow map placed weapons
-mp_playercashawards|Rounds & Match|b|1|Cash awards for player actions
-mp_teamcashawards|Rounds & Match|b|1|Cash awards for team results
+mp_respawn_on_death_t|Respawn & Spawns|b|0|Terrorists respawn after death
+mp_respawn_on_death_ct|Respawn & Spawns|b|0|Counter-terrorists respawn after death
+mp_free_armor|Economy & Armor|e:0,1,2|0|Free armor (1 kevlar, 2 kevlar+helmet)
+mp_defuser_allocation|Economy & Armor|e:0,1,2|0|Free defuse kits (1 random CT, 2 all CT)
+mp_death_drop_gun|Drops & C4|e:0,1,2|1|Drop weapon on death (0 none, 1 best, 2 current)
+mp_death_drop_grenade|Drops & C4|e:0,1,2,3|2|Drop grenades on death (0 none, 1 best, 2 current, 3 all)
+mp_weapons_allow_map_placed|Weapon Restrictions|b|1|Allow map placed weapons
+mp_playercashawards|Economy & Armor|b|1|Cash awards for player actions
+mp_teamcashawards|Economy & Armor|b|1|Cash awards for team results
 mp_autoteambalance|Teams & Players|b|1|Automatic team balancing
 mp_limitteams|Teams & Players|i|2|Max team size difference (0 = no limit)
 mp_force_pick_time|Teams & Players|i|15|Seconds a player has to pick a team
@@ -2777,7 +2807,7 @@ mp_autokick|Teams & Players|b|1|Kick idle players and team killers
 mp_friendlyfire|Teams & Players|b|0|Friendly fire
 mp_solid_teammates|Teams & Players|e:0,1,2|1|Teammates are solid (0 no, 1 yes, 2 only after round)
 mp_tkpunish|Teams & Players|b|0|Punish team killers next round
-mp_spectators_max|Teams & Players|i|2|Maximum spectators
+mp_spectators_max|Spectator|i|2|Maximum spectators
 mp_teamname_1|Teams & Players|s|team name|Counter-terrorist team name
 mp_teamname_2|Teams & Players|s|team name|Terrorist team name
 sv_gravity|Movement & Weapons|i|800|Gravity
@@ -2826,6 +2856,101 @@ bot_defer_to_human_goals|Bots|b|0|Bots leave objectives to humans
 bot_defer_to_human_items|Bots|b|0|Bots leave items to humans
 mp_logdetail|Logging|e:0,1,2,3|0|Log damage detail (0 off ... 3 all)
 sv_logecho|Logging|b|1|Echo log lines to the console
+sv_human_autojoin_team|Teams & Players|i|0|Automatic team for human players (0 = they choose)
+mp_humanteam|Teams & Players|e:any,CT,T|any|Restrict human players to one team
+mp_teammates_are_enemies|Teams & Players|b|0|Teammates count as enemies (everyone is a valid target)
+sv_spec_hear|Spectator|e:0,1,2,3,4|1|Who spectators hear (0 spectators, 1 all, 2 spectated team, 3 self, 4 nobody)
+sv_talk_after_dying_time|Spectator|f|0|Seconds a player can still talk after dying
+sv_auto_full_alltalk_during_warmup_half_end|Spectator|b|1|Full all-talk during warmup / halftime / match end
+sv_chat_proximity|Voice & Chat|b|0|Proximity chat (where supported)
+sv_voice_proximity|Voice & Chat|b|0|Proximity voice (where supported)
+sv_vote_issue_timeout_allowed|Votes|b|1|Allow the Timeout vote
+sv_vote_issue_nextlevel_allowed|Votes|b|1|Allow the Next Level vote
+sv_vote_issue_nextlevel_allowextend|Votes|b|1|Allow extending the map through the next-level vote
+sv_vote_issue_swap_teams_allowed|Votes|b|0|Allow the Swap Teams vote
+sv_vote_issue_surrrender_allowed|Votes|b|1|Allow the Surrender vote (the ConVar really is spelled surrrender)
+sv_vote_issue_pause_match_allowed|Votes|b|1|Allow the Pause / Unpause vote
+sv_vote_issue_matchready_allowed|Votes|b|1|Allow the Match Ready / Unready vote
+sv_vote_issue_loadbackup_allowed|Votes|b|1|Allow the Load Backup vote
+sv_vote_issue_pause_match_spec_only|Votes|b|0|Restrict pause voting to spectators
+sv_vote_quorum_ratio|Votes|f|0.501|Share of players needed for a vote to resolve
+sv_vote_creation_timer|Votes|i|120|Seconds between votes
+sv_vote_allow_spectators|Votes|b|0|Spectators may take part in votes
+sv_vote_count_spectator_votes|Votes|b|0|Spectator votes count
+mp_team_timeout_max|Timeouts|i|1|Team timeouts per match (0 = none)
+mp_team_timeout_time|Timeouts|i|30|Length of a team timeout (seconds)
+mp_technical_timeout_per_team|Timeouts|i|2|Technical timeouts per team (0 = none)
+mp_technical_timeout_duration_s|Timeouts|i|600|Technical timeout length (seconds)
+mp_buy_during_immunity|Buy & Shop|b|0|Players can buy during spawn immunity
+mp_buy_allow_guns|Buy & Shop|i|63|Gun categories that can be bought (bitmask: 1 pistols, 2 SMGs, 4 rifles, 8 shotguns, 16 snipers, 32 heavy MG; 0 none, 63 all)
+mp_buy_allow_grenades|Buy & Shop|b|1|Grenades can be bought
+sv_buy_status_override|Buy & Shop|e:0,1,2,3|0|Who can buy (0 everyone, 1 CT only, 2 T only, 3 nobody)
+mp_weapons_allow_pistols|Weapon Restrictions|e:-1,0,2,3|-1|Pistols allowed for (-1 both teams, 0 nobody, 2 T, 3 CT)
+mp_weapons_allow_smgs|Weapon Restrictions|e:-1,0,2,3|-1|SMGs allowed for (-1 both, 0 nobody, 2 T, 3 CT)
+mp_weapons_allow_rifles|Weapon Restrictions|e:-1,0,2,3|-1|Rifles allowed for (-1 both, 0 nobody, 2 T, 3 CT)
+mp_weapons_allow_heavy|Weapon Restrictions|e:-1,0,2,3|-1|Heavy weapons allowed for (-1 both, 0 nobody, 2 T, 3 CT)
+mp_weapons_allow_zeus|Weapon Restrictions|i|1|Zeus purchases per round (0 none, -1 unlimited)
+mp_weapons_allow_typecount|Weapon Restrictions|i|5|Purchases per weapon type per player and round (0 none, -1 unlimited)
+mp_weapons_max_gun_purchases_per_weapon_per_match|Weapon Restrictions|i|-1|Purchases of any one weapon per match (-1 = no limit)
+mp_weapons_allow_heavyassaultsuit|Weapon Restrictions|b|0|Heavy assault suit can be used
+mp_heavyassaultsuit_cooldown|Weapon Restrictions|i|0|Heavy assault suit purchase cooldown
+mp_items_prohibited|Weapon Restrictions|s|9,40|Comma-separated weapon definition indices that are banned (verify the index first)
+mp_death_drop_c4|Drops & C4|b|1|Drop the C4 on death
+mp_death_drop_defuser|Drops & C4|b|1|Drop the defuse kit on death
+mp_death_drop_taser|Drops & C4|b|1|Drop the Zeus on death
+mp_death_drop_breachcharge|Drops & C4|b|1|Drop the breach charge on death
+mp_death_drop_healthshot|Drops & C4|b|1|Drop the healthshot on death
+mp_warmup_items_drop_policy|Drops & C4|i|247|Warmup item drops (bitfield: 1 gun, 2 C4, 4 grenade, 8 defuser, 16 taser, 32 healthshot)
+mp_anyone_can_pickup_c4|Drops & C4|b|0|Anyone can pick up the C4
+mp_c4_cannot_be_defused|Drops & C4|b|0|The planted C4 cannot be defused
+mp_max_armor|Economy & Armor|e:0,1,2|2|Highest armor level that can be bought (0 none, 1 kevlar, 2 kevlar+helmet)
+mp_economy_reset_rounds|Economy & Armor|i|0|Reset all money every N rounds (0 = never)
+mp_equipment_reset_rounds|Economy & Armor|i|0|Reset equipment every N rounds (0 = never)
+mp_damage_headshot_only|Damage & Health|b|0|Only headshots deal damage
+mp_damage_scale_t_head|Damage & Health|f|1.0|Head damage multiplier against Terrorists
+mp_weapon_self_inflict_amount|Damage & Health|f|0|Self damage for missed shots
+mp_damage_vampiric_amount|Damage & Health|f|0|Share of dealt damage returned as health
+mp_global_damage_per_second|Damage & Health|f|0|Non-lethal damage to everyone every second
+ff_damage_decoy_explosion|Damage & Health|f|0|Team damage from decoy explosions
+mp_winlimit|Rounds & Match|i|0|Win limit (0 = off)
+mp_match_restart_delay|Rounds & Match|i|15|Seconds before the match restarts
+mp_join_grace_time|Rounds & Match|i|0|Seconds after round start during which players may join
+mp_warmup_online_enabled|Warmup|b|1|Warmup on online servers (needed for warmup to run on a dedicated server)
+mp_warmup_offline_enabled|Warmup|b|0|Warmup in offline/bot games
+mp_warmup_items_nocost|Warmup|b|0|Free weapons during warmup
+mp_warmup_items_nocount_policy|Warmup|i|42|Warmup unlimited-item bitfield
+mp_warmup_jointeam_cooldown|Warmup|i|2|Team join cooldown during warmup (seconds)
+mp_warmuptime_all_players_connected|Warmup|i|15|Warmup length once all players are connected (the game modes shorten warmup to this)
+mp_use_respawn_waves|Respawn & Spawns|e:0,1,2|0|Respawn waves (1 in waves, 2 when the whole team is dead)
+mp_respawnwavetime_ct|Respawn & Spawns|i|10|CT respawn wave interval (seconds)
+mp_respawnwavetime_t|Respawn & Spawns|i|10|T respawn wave interval (seconds)
+mp_respawn_immunitytime|Respawn & Spawns|f|0|Spawn immunity (seconds)
+mp_randomspawn|Respawn & Spawns|e:0,1,2,3|0|Random spawns (1 both, 2 T, 3 CT)
+mp_randomspawn_los|Respawn & Spawns|b|0|Line-of-sight check for random spawns
+mp_randomspawn_dist|Respawn & Spawns|i|0|Distance check for random spawns
+ammo_grenade_limit_flashbang|Grenades & Ammo|i|2|Flashbang limit
+ammo_grenade_limit_total|Grenades & Ammo|i|4|Total grenade limit
+sv_grenade_trajectory_prac_trailtime|Grenades & Ammo|f|0|Practice grenade trail time (seconds)
+sv_grenade_trajectory_prac_pipreview|Grenades & Ammo|b|0|Practice grenade trajectory preview
+sv_falldamage_to_below_player_ratio|Movement & Weapons|f|0|Damage ratio when landing on another player's head
+sv_falldamage_to_below_player_multiplier|Movement & Weapons|f|0|Multiplier for the damage players below take
+bot_allow_pistols|Bots|b|1|Bots may use pistols
+bot_allow_shotguns|Bots|b|1|Bots may use shotguns
+bot_allow_sub_machine_guns|Bots|b|1|Bots may use SMGs
+bot_allow_rifles|Bots|b|1|Bots may use rifles
+bot_allow_machine_guns|Bots|b|1|Bots may use machine guns
+bot_allow_grenades|Bots|b|1|Bots may use grenades
+bot_allow_snipers|Bots|b|1|Bots may use sniper rifles
+bot_join_team|Bots|e:any,T,CT|any|Team the bots join
+mp_endmatch_votenextmap|Map Voting|b|1|End-of-match next-map vote
+mp_endmatch_votenextmap_keepcurrent|Map Voting|b|1|Keep the current map as an option in that vote
+mp_endmatch_votenextleveltime|Map Voting|i|20|Length of the end-of-match vote (seconds)
+nextlevel|Map Voting|s|de_dust2|Next map
+mapcyclefile|Map Voting|s|mapcycle.txt|Map cycle file
+mp_backup_round_auto|Backup & Pause|b|1|Keep in-memory round backups
+mp_backup_round_file|Backup & Pause|s|backup|Round backup file name
+mp_backup_round_file_pattern|Backup & Pause|s|pattern|Round backup file name pattern
+mp_backup_restore_load_autopause|Backup & Pause|b|1|Pause automatically after restoring a backup
 EOF
 }
 
@@ -2855,9 +2980,19 @@ catalog_load() {
     local k c t h d n l on off
     while IFS='|' read -r k c t h d; do
         [[ -n $k ]] || continue
+        [[ -n ${CAT_TYPE[$k]+x} ]] && continue
         CAT_KEYS+=("$k"); CAT_TYPE[$k]=$t; CAT_CAT[$k]=$c; CAT_HINT[$k]=$h; CAT_DESC[$k]=$d
         [[ " ${CAT_CATS[*]} " == *" ${c// /_} "* ]] || CAT_CATS+=("${c// /_}")
     done < <(catalog_rows)
+    # fixed, sensible category order (unknown categories stay at the end)
+    local o; local -a ordered=()
+    for o in General Teams_\&_Players Rounds_\&_Match Warmup Buy_\&_Shop Economy_\&_Armor Weapon_Restrictions Drops_\&_C4 Damage_\&_Health \
+             Respawn_\&_Spawns Grenades_\&_Ammo Movement_\&_Weapons Voice_\&_Chat Votes Spectator Timeouts Bots Map_Voting Backup_\&_Pause \
+             Clients_\&_Network GOTV Logging; do
+        [[ " ${CAT_CATS[*]} " == *" $o "* ]] && ordered+=("$o")
+    done
+    for o in "${CAT_CATS[@]}"; do [[ " ${ordered[*]} " == *" $o "* ]] || ordered+=("$o"); done
+    CAT_CATS=("${ordered[@]}")
     while IFS='|' read -r n l t on off; do
         [[ -n $n ]] || continue
         FT_KEYS+=("$n"); FT_LABEL[$n]=$l; FT_KIND[$n]=$t; FT_ON[$n]=$on; FT_OFF[$n]=$off
@@ -3131,9 +3266,10 @@ st_mode_ui() {   # <id>: game mode + round time + warmup
                 if ! [[ $ANSWER =~ ^[0-9]{1,4}$ ]] || ((10#$ANSWER > 3600)); then err "Enter a whole number between 0 and 3600."; sleep 1; continue; fi
                 v=$((10#$ANSWER))
                 if ((v == 0)); then
-                    st_update "$id" '.cvars.mp_do_warmup_period = "0" | .cvars.mp_warmuptime = "0"' >/dev/null && ok "Warmup disabled."
+                    st_update "$id" '.cvars.mp_do_warmup_period = "0" | .cvars.mp_warmuptime = "0" | .cvars.mp_warmuptime_all_players_connected = "0"' >/dev/null && ok "Warmup disabled."
                 else
-                    st_update "$id" '.cvars.mp_do_warmup_period = "1" | .cvars.mp_warmuptime = $v' --arg v "$v" >/dev/null && ok "Warmup time set to $v seconds."
+                    # the game modes also shorten warmup once everyone is connected, and online warmup must be enabled
+                    st_update "$id" '.cvars.mp_do_warmup_period = "1" | .cvars.mp_warmup_online_enabled = "1" | .cvars.mp_warmuptime = $v | .cvars.mp_warmuptime_all_players_connected = $v' --arg v "$v" >/dev/null && ok "Warmup time set to $v seconds."
                 fi
                 st_cfg_refresh "$id"
                 ((id > 0)) && is_running "$id" && info "Use 'Apply now' in the settings menu to push it to the running server."
@@ -3306,7 +3442,7 @@ st_apply_ui() {   # <id>
     write_server_cfg "$S_PATH" "$S_NAME" "$S_MAX" "$S_PORT" "$id" || { err "Could not write server.cfg."; return; }
     ok "server.cfg updated."
     if is_running "$id"; then
-        confirm_yn "Apply now on the running server (exec server.cfg)? [Y/n]: " y && console_send "$id" "exec server.cfg" && ok "Applied."
+        confirm_yn "Apply now on the running server (exec cs2nexus_settings.cfg)? [Y/n]: " y && console_send "$id" "exec cs2nexus_settings.cfg" && ok "Applied."
     fi
 }
 
@@ -3314,6 +3450,106 @@ st_reset_ui() {   # <id>
     confirm_yn "Reset ALL settings of this server to the DEFAULT settings? [y/N]: " n || { info "Cancelled."; return; }
     settings_clone_default "$1" && load_server "$1" && write_server_cfg "$S_PATH" "$S_NAME" "$S_MAX" "$S_PORT" "$1" >/dev/null 2>&1 \
         && ok "Settings reset to the defaults."
+}
+
+# name|label|settings ("cvar value;cvar value;...")
+preset_rows() { cat <<'EOF'
+free_server|Free server base (no balancing, no votes, no timeouts, all talk)|mp_autoteambalance 0;mp_limitteams 0;mp_force_pick_time 0;mp_forcecamera 0;mp_autokick 0;mp_solid_teammates 0;sv_human_autojoin_team 0;sv_allow_votes 0;sv_vote_issue_kick_allowed 0;sv_vote_issue_timeout_allowed 0;sv_vote_issue_changelevel_allowed 0;sv_vote_issue_nextlevel_allowed 0;sv_vote_issue_nextlevel_allowextend 0;sv_vote_issue_restart_game_allowed 0;sv_vote_issue_scramble_teams_allowed 0;sv_vote_issue_swap_teams_allowed 0;sv_vote_issue_surrrender_allowed 0;sv_vote_issue_pause_match_allowed 0;sv_vote_issue_matchready_allowed 0;sv_vote_issue_loadbackup_allowed 0;mp_team_timeout_max 0;mp_technical_timeout_per_team 0;sv_full_alltalk 1;sv_deadtalk 1;sv_voiceenable 1
+no_votes|Disable every player vote|sv_allow_votes 0;sv_vote_issue_kick_allowed 0;sv_vote_issue_timeout_allowed 0;sv_vote_issue_changelevel_allowed 0;sv_vote_issue_nextlevel_allowed 0;sv_vote_issue_nextlevel_allowextend 0;sv_vote_issue_restart_game_allowed 0;sv_vote_issue_scramble_teams_allowed 0;sv_vote_issue_swap_teams_allowed 0;sv_vote_issue_surrrender_allowed 0;sv_vote_issue_pause_match_allowed 0;sv_vote_issue_matchready_allowed 0;sv_vote_issue_loadbackup_allowed 0
+no_timeouts|No team or technical timeouts|mp_team_timeout_max 0;mp_technical_timeout_per_team 0;sv_vote_issue_timeout_allowed 0
+no_shop|Disable the whole shop|sv_buy_status_override 3
+no_gun_shop|Block gun purchases only|mp_buy_allow_guns 0
+no_grenade_shop|Block grenade purchases only|mp_buy_allow_grenades 0
+no_drops|No weapon / C4 / kit drops on death|mp_death_drop_gun 0;mp_death_drop_c4 0;mp_death_drop_defuser 0;mp_death_drop_taser 0;mp_death_drop_breachcharge 0;mp_death_drop_healthshot 0
+anyone_c4|Anyone can pick up the C4|mp_anyone_can_pickup_c4 1
+no_defuse|The planted C4 cannot be defused|mp_c4_cannot_be_defused 1
+pass_teammates|Players walk through teammates|mp_solid_teammates 0
+headshot_only|Only headshots deal damage|mp_damage_headshot_only 1
+EOF
+}
+
+st_presets_ui() {   # <id>
+    local id=$1 c i n label pairs obj cnt pr
+    local -a labels=() defs=()
+    while IFS='|' read -r n label pairs; do labels+=("$label"); defs+=("$pairs"); done < <(preset_rows)
+    while :; do
+        header "PRESETS - $( ((id == 0)) && echo 'DEFAULT' || echo "$S_NAME")"
+        echo "  A preset writes a group of CFG settings at once. You can still change each one later."
+        echo
+        i=0
+        for label in "${labels[@]}"; do i=$((i + 1)); printf '  %2s) %s\n' "$i" "$label"; done
+        echo "   b) Back"
+        echo
+        read -r -p "Preset: " c || exit 0
+        c=$(trim "$c")
+        [[ $c == b || $c == B || $c == q || $c == Q ]] && return
+        if ! [[ $c =~ ^[0-9]+$ ]] || ((10#$c < 1 || 10#$c > ${#defs[@]})); then err "Invalid option."; sleep 1; continue; fi
+        pairs=${defs[$((10#$c - 1))]}
+        echo; echo "  '${labels[$((10#$c - 1))]}' writes:"
+        IFS=';' read -ra pr <<<"$pairs"
+        printf '    %s\n' "${pr[@]}"
+        echo
+        confirm_yn "Apply this preset? [y/N]: " n || continue
+        obj=$(jq -nc --arg s "$pairs" '$s | split(";") | map(split(" ") | {(.[0]): .[1]}) | add')
+        cnt=${#pr[@]}
+        st_update "$id" '.cvars += $o' --argjson o "$obj" >/dev/null && ok "Preset applied ($cnt settings)."
+        st_cfg_refresh "$id"
+        sleep 1
+    done
+}
+
+st_live_ui() {   # <id>  (running server only)
+    local id=$1 c
+    local -a labels=("End warmup now" "Pause the match" "Resume the match" "Restart the game (all scores reset)" "Swap teams" "Scramble teams" "Re-apply the CS2Nexus settings (exec cs2nexus_settings.cfg)" "Reload server.cfg (exec server.cfg)")
+    local -a cmds=("mp_warmup_end" "mp_pause_match" "mp_unpause_match" "mp_restartgame 1" "mp_swapteams 1" "mp_scrambleteams 1" "exec cs2nexus_settings.cfg" "exec server.cfg")
+    local -a ask_first=(0 0 0 1 1 1 0 0)
+    local i
+    if ! is_running "$id"; then warn "$S_NAME is offline. Start it first."; return; fi
+    while :; do
+        header "LIVE ACTIONS - $S_NAME"
+        i=0
+        for c in "${labels[@]}"; do i=$((i + 1)); printf '  %s) %s\n' "$i" "$c"; done
+        echo "  b) Back"
+        echo
+        read -r -p "Select: " c || exit 0
+        c=$(trim "$c")
+        [[ $c == b || $c == B || $c == q || $c == Q ]] && return
+        if ! [[ $c =~ ^[0-9]+$ ]] || ((10#$c < 1 || 10#$c > ${#cmds[@]})); then err "Invalid option."; sleep 1; continue; fi
+        i=$((10#$c - 1))
+        if ((ask_first[i])); then confirm_yn "${labels[i]} on $S_NAME now? [y/N]: " n || continue; fi
+        console_send "$id" "${cmds[i]}" && ok "Sent: ${cmds[i]}"
+        sleep 1
+    done
+}
+
+st_check_ui() {   # <id>: ask the running server what it really uses
+    local id=$1 k want line out got flag
+    local -a keys
+    if ! is_running "$id"; then warn "$S_NAME is offline. Start it first."; return; fi
+    mapfile -t keys < <(st_get "$id" | jq -r '.cvars // {} | keys[]' 2>/dev/null)
+    if ((${#keys[@]} == 0)); then info "No raw CFG settings are saved for this server (round time and warmup are CFG settings too)."; return; fi
+    if ((${#keys[@]} > 40)); then warn "Checking the first 40 of ${#keys[@]} settings."; keys=("${keys[@]:0:40}"); fi
+    info "Asking $S_NAME for the current value of ${#keys[@]} setting(s)..."
+    for k in "${keys[@]}"; do
+        [[ $k =~ ^[A-Za-z0-9_]+$ ]] || continue
+        console_send "$id" "$k" >/dev/null; sleep 0.15
+    done
+    sleep 1
+    out=$(tmux_cs2 capture-pane -p -J -t "=$(session_name "$id"):" -S -1500 2>/dev/null)
+    echo; sep
+    for k in "${keys[@]}"; do
+        [[ $k =~ ^[A-Za-z0-9_]+$ ]] || continue
+        want=$(st_get "$id" | jq -r --arg k "$k" '.cvars[$k]')
+        line=$(grep -E "(^|[^A-Za-z0-9_])${k}[\" ]*=" <<<"$out" | tail -n 1 | cut -c1-100)
+        got=$(sed -nE 's/.*=[[:space:]]*"?([^" ]+)"?.*/\1/p' <<<"$line" | head -n 1)
+        flag=""
+        if [[ -n $got ]]; then
+            if awk -v a="$got" -v b="$want" 'BEGIN{exit !((a == b) || (a+0 == b+0 && a ~ /^-?[0-9.]+$/ && b ~ /^-?[0-9.]+$/))}'; then flag="${GREEN}OK${RESET}"; else flag="${RED}DIFFERENT${RESET}"; fi
+        fi
+        printf '%-36s wanted %-9s server says: %-34s %s\n' "$k" "$want" "${got:-(no answer found)}" "$flag"
+    done
+    sep
+    info "If a value differs: use 'Live actions' -> Re-apply, and see whether it changes again after a map change."
 }
 
 settings_target_menu() {   # <id>
@@ -3325,26 +3561,35 @@ settings_target_menu() {   # <id>
         ((id > 0)) && [[ -z $(st_get "$id") ]] && info "This server has no saved settings yet (its cfg is untouched until you change something)."
         echo "  Saved: $(st_entry_summary "$id" 2>/dev/null)"
         echo
-        echo "  1) Basics (name, port, client limit, start map$( ((id > 0)) && echo ', GSLT'))"
-        echo "  2) Game mode, round time & warmup"
-        echo "  3) Quick options (bunny hop, team rules, all talk, ...)"
-        echo "  4) CFG settings (every cvar, by category)"
-        echo "  5) Custom cfg lines"
-        echo "  6) View generated cfg"
-        if ((id == 0)); then echo "  7) Apply the defaults to ALL existing servers"
-        else echo "  7) Apply now (write cfg / exec on the running server)"; echo "  8) Reset this server to the defaults"; fi
-        echo "  b) Back"
+        echo "   1) Basics (name, port, client limit, start map$( ((id > 0)) && echo ', GSLT'))"
+        echo "   2) Game mode, round time & warmup"
+        echo "   3) Quick options (bunny hop, team rules, all talk, ...)"
+        echo "   4) Presets (free server, no votes, no shop, ...)"
+        echo "   5) CFG settings (every cvar, by category)"
+        echo "   6) Custom cfg lines"
+        echo "   7) View generated cfg"
+        if ((id == 0)); then echo "   8) Apply the defaults to ALL existing servers"
+        else
+            echo "   8) Apply now (write cfg / exec on the running server)"
+            echo "   9) Reset this server to the defaults"
+            echo "  10) Live actions (end warmup, pause, restart, swap teams, ...)"
+            echo "  11) Check what the running server really uses"
+        fi
+        echo "   b) Back"
         echo
         read -r -p "Select: " c || exit 0
         case "$(trim "$c")" in
             1) st_basics_ui "$id" ;;
             2) st_mode_ui "$id" ;;
             3) st_quick_ui "$id" ;;
-            4) st_cvars_ui "$id" ;;
-            5) st_custom_ui "$id" ;;
-            6) st_view_ui "$id"; pause ;;
-            7) st_apply_ui "$id"; pause ;;
-            8) ((id > 0)) && { st_reset_ui "$id"; pause; } ;;
+            4) st_presets_ui "$id" ;;
+            5) st_cvars_ui "$id" ;;
+            6) st_custom_ui "$id" ;;
+            7) st_view_ui "$id"; pause ;;
+            8) st_apply_ui "$id"; pause ;;
+            9) ((id > 0)) && { st_reset_ui "$id"; pause; } ;;
+            10) ((id > 0)) && { load_server "$id"; st_live_ui "$id"; } ;;
+            11) ((id > 0)) && { load_server "$id"; st_check_ui "$id"; pause; } ;;
             b|B|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -3398,6 +3643,7 @@ plugin_profile_local() {   # <name> -> csv | -
     local d
     case $1 in
         AstraSkins) echo "data/astra_skins.sqlite"; return ;;
+        FakeBan|ServerCommands) echo "data"; return ;;
     esac
     d=$(st_get 0 | jq -r '(.plugins.local // []) | join(",")' 2>/dev/null)
     echo "${d:--}"
@@ -3584,23 +3830,42 @@ prompt_plugin_options() {
     local defl=$1 defx=$2 defi=$3 in x bad cur
     local -a arr clean
     [[ $defl == "-" ]] && defl=""
+    local dm=2
+    [[ -n $defl ]] && dm=3
+    [[ $defl == "data" ]] && dm=1
     echo
-    info "Per-server items: files/folders inside the plugin that must stay REAL per-server files"
-    info "(e.g. a database like data/astra_skins.sqlite). Everything else is shared. Enter 'none' for nothing."
+    echo "  Plugin data mode (databases, history, settings stored inside the plugin folder):"
+    echo "    1) Independent - every server keeps its own data (folder 'data')"
+    echo "    2) Shared      - all servers use the same data from the one central plugin copy"
+    echo "    3) Custom      - choose exactly which files/folders are per-server (the rest is shared)"
+    warn "Changing the mode later does not move existing data; a differing real data folder is left untouched."
     while :; do
-        ask "Per-server items (comma separated)" "$defl" || return 1
-        in=${ANSWER//[[:space:]]/}
-        [[ ${in,,} == none ]] && in=""
-        IFS=, read -ra arr <<<"$in"
-        clean=(); bad=0
-        for x in "${arr[@]}"; do
-            [[ -z $x ]] && continue
-            if valid_local_path "$x"; then clean+=("$x"); else err "Invalid path: $x"; bad=1; fi
-        done
-        ((bad)) && continue
-        OPT_LOCAL_CSV=$(printf '%s\n' "${clean[@]}" | awk 'NF && !s[$0]++' | paste -sd, -)
-        [[ -z $OPT_LOCAL_CSV ]] && OPT_LOCAL_CSV="-"
-        break
+        ask "Data mode" "$dm" || return 1
+        case $ANSWER in
+            1) OPT_LOCAL_CSV="data"; break ;;
+            2) OPT_LOCAL_CSV="-"; break ;;
+            3)
+                info "Per-server items: files/folders inside the plugin that stay REAL per-server (e.g. data/astra_skins.sqlite)."
+                info "Everything else is shared. Enter 'none' for nothing."
+                [[ -z $defl || $defl == "data" ]] && defl="data"
+                while :; do
+                    ask "Per-server items (comma separated)" "$defl" || return 1
+                    in=${ANSWER//[[:space:]]/}
+                    [[ ${in,,} == none ]] && in=""
+                    IFS=, read -ra arr <<<"$in"
+                    clean=(); bad=0
+                    for x in "${arr[@]}"; do
+                        [[ -z $x ]] && continue
+                        if valid_local_path "$x"; then clean+=("$x"); else err "Invalid path: $x"; bad=1; fi
+                    done
+                    ((bad)) && continue
+                    OPT_LOCAL_CSV=$(printf '%s\n' "${clean[@]}" | awk 'NF && !s[$0]++' | paste -sd, -)
+                    [[ -z $OPT_LOCAL_CSV ]] && OPT_LOCAL_CSV="-"
+                    break
+                done
+                break ;;
+            *) err "Enter 1, 2 or 3." ;;
+        esac
     done
     OPT_EXCL_CSV="-"; OPT_INCL_CSV="-"
     cur=1; [[ $defi != "-" ]] && cur=2; [[ $defx != "-" ]] && cur=3
