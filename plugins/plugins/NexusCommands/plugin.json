@@ -1,0 +1,19 @@
+{
+  "name": "NexusCommands",
+  "version": "1.0.0",
+  "author": "NEPENTII / CS2Nexus",
+  "description": "Adds or renames chat/console commands of any plugin. Managed by the CS2Nexus launcher (Plugins -> Plugin settings).",
+  "commands": [
+    {
+      "name": "nexus_reload",
+      "description": "Reload the alias table (server console only)"
+    },
+    {
+      "name": "nexus_aliases",
+      "description": "List active aliases (server console only)"
+    }
+  ],
+  "configs": [
+    "configs/plugins/NexusCommands/NexusCommands.json"
+  ]
+}

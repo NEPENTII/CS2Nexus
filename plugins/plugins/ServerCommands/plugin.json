@@ -1,0 +1,446 @@
+{
+  "name": "ServerCommands",
+  "version": "4.0.0",
+  "author": "NEPENTII / CS2Nexus",
+  "description": "Central admin plugin: admin commands with menus, admin tags (| ADMIN | name), gag/mute, fake bans (kick only), match flow, game modes.",
+  "commands": [
+    {
+      "name": "rr",
+      "description": "Restart round.",
+      "usage": "/rr",
+      "aliases": []
+    },
+    {
+      "name": "rs",
+      "description": "Reset your own score.",
+      "usage": "/rs",
+      "aliases": []
+    },
+    {
+      "name": "start",
+      "description": "Start match (knife round first if enabled).",
+      "usage": "/start",
+      "aliases": []
+    },
+    {
+      "name": "end",
+      "description": "End match (back to warmup).",
+      "usage": "/end",
+      "aliases": []
+    },
+    {
+      "name": "endwarmup",
+      "description": "End warmup.",
+      "usage": "/endwarmup",
+      "aliases": []
+    },
+    {
+      "name": "startwarmup",
+      "description": "Restart warmup.",
+      "usage": "/startwarmup",
+      "aliases": []
+    },
+    {
+      "name": "pausewarmup",
+      "description": "Pause / resume the warmup timer.",
+      "usage": "/pausewarmup",
+      "aliases": []
+    },
+    {
+      "name": "kniferound",
+      "description": "Toggle the knife round before the match.",
+      "usage": "/kniferound",
+      "aliases": []
+    },
+    {
+      "name": "stay",
+      "description": "Knife round winners: stay on the side.",
+      "usage": "/stay",
+      "aliases": []
+    },
+    {
+      "name": "switch",
+      "description": "Knife round winners: switch sides.",
+      "usage": "/switch",
+      "aliases": []
+    },
+    {
+      "name": "pause",
+      "description": "Request a pause (needs both teams).",
+      "usage": "/pause",
+      "aliases": []
+    },
+    {
+      "name": "unpause",
+      "description": "Request to continue (needs both teams).",
+      "usage": "/unpause",
+      "aliases": []
+    },
+    {
+      "name": "fpause",
+      "description": "Force pause.",
+      "usage": "/fpause",
+      "aliases": []
+    },
+    {
+      "name": "funpause",
+      "description": "Force unpause.",
+      "usage": "/funpause",
+      "aliases": []
+    },
+    {
+      "name": "lock",
+      "description": "Lock / unlock team changes.",
+      "usage": "/lock",
+      "aliases": []
+    },
+    {
+      "name": "bh",
+      "description": "BunnyHop on/off.",
+      "usage": "/bh <1|0>",
+      "aliases": [
+        "bh1",
+        "bh0"
+      ]
+    },
+    {
+      "name": "ff",
+      "description": "Friendly Fire on/off.",
+      "usage": "/ff <1|0>",
+      "aliases": [
+        "ff1",
+        "ff0"
+      ]
+    },
+    {
+      "name": "t",
+      "description": "All Talk on/off.",
+      "usage": "/t <1|0>",
+      "aliases": [
+        "t1",
+        "t0"
+      ]
+    },
+    {
+      "name": "hs",
+      "description": "Headshot Only on/off.",
+      "usage": "/hs <1|0>",
+      "aliases": [
+        "hs1",
+        "hs0"
+      ]
+    },
+    {
+      "name": "casual",
+      "description": "Switch to casual.",
+      "usage": "/casual",
+      "aliases": []
+    },
+    {
+      "name": "comp",
+      "description": "Switch to comp.",
+      "usage": "/comp",
+      "aliases": [
+        "competitive"
+      ]
+    },
+    {
+      "name": "dm",
+      "description": "Switch to dm.",
+      "usage": "/dm",
+      "aliases": [
+        "deathmatch"
+      ]
+    },
+    {
+      "name": "mix",
+      "description": "Switch to mix.",
+      "usage": "/mix",
+      "aliases": [
+        "mm",
+        "match"
+      ]
+    },
+    {
+      "name": "aim",
+      "description": "Switch to aim.",
+      "usage": "/aim",
+      "aliases": []
+    },
+    {
+      "name": "prac",
+      "description": "Switch to prac.",
+      "usage": "/prac",
+      "aliases": [
+        "practice"
+      ]
+    },
+    {
+      "name": "retakes",
+      "description": "Switch to retakes.",
+      "usage": "/retakes",
+      "aliases": [
+        "retake"
+      ]
+    },
+    {
+      "name": "warmup",
+      "description": "Switch to warmup.",
+      "usage": "/warmup",
+      "aliases": []
+    },
+    {
+      "name": "map",
+      "description": "Change map.",
+      "usage": "/map <map>",
+      "aliases": []
+    },
+    {
+      "name": "wmap",
+      "description": "Change to a workshop map (workshop id).",
+      "usage": "/wmap <workshop id>",
+      "aliases": []
+    },
+    {
+      "name": "maxrounds",
+      "description": "Set mp_maxrounds.",
+      "usage": "/maxrounds <rounds>",
+      "aliases": []
+    },
+    {
+      "name": "freezetime",
+      "description": "Set mp_freezetime.",
+      "usage": "/freezetime <seconds>",
+      "aliases": []
+    },
+    {
+      "name": "rcon",
+      "description": "Run a server console command.",
+      "usage": "/rcon <command>",
+      "aliases": []
+    },
+    {
+      "name": "asay",
+      "description": "Admin message in chat.",
+      "usage": "/asay <message>",
+      "aliases": []
+    },
+    {
+      "name": "hsay",
+      "description": "Admin message in the center of the screen.",
+      "usage": "/hsay <message>",
+      "aliases": []
+    },
+    {
+      "name": "bot",
+      "description": "Practice bots: /bot [ct|t|kick|freeze|go].",
+      "usage": "/bot [ct|t|kick|freeze|go]",
+      "aliases": []
+    },
+    {
+      "name": "plist",
+      "description": "List online players.",
+      "usage": "/plist",
+      "aliases": []
+    },
+    {
+      "name": "admins",
+      "description": "Show the online admins.",
+      "usage": "/admins",
+      "aliases": []
+    },
+    {
+      "name": "knife",
+      "description": "Currently disabled.",
+      "usage": "/knife",
+      "aliases": []
+    },
+    {
+      "name": "wp",
+      "description": "Currently disabled.",
+      "usage": "/wp",
+      "aliases": []
+    },
+    {
+      "name": "ws",
+      "description": "Currently disabled.",
+      "usage": "/ws",
+      "aliases": []
+    },
+    {
+      "name": "kick",
+      "description": "Kick a player.",
+      "usage": "/kick <player> [reason]",
+      "aliases": [
+        "kickid"
+      ]
+    },
+    {
+      "name": "slay",
+      "description": "Kill a player.",
+      "usage": "/slay <player|@ct|@t|@all>",
+      "aliases": []
+    },
+    {
+      "name": "respawn",
+      "description": "Respawn a player.",
+      "usage": "/respawn <player|@ct|@t|@all>",
+      "aliases": []
+    },
+    {
+      "name": "spectate",
+      "description": "Spectate a player.",
+      "usage": "/spectate <player>",
+      "aliases": []
+    },
+    {
+      "name": "slap",
+      "description": "Slap a player.",
+      "usage": "/slap <player> [damage]",
+      "aliases": []
+    },
+    {
+      "name": "move",
+      "description": "Move a player to another team.",
+      "usage": "/move <player|@group> <t|ct|spec>",
+      "aliases": []
+    },
+    {
+      "name": "rename",
+      "description": "Rename a player.",
+      "usage": "/rename <player> <new name>",
+      "aliases": []
+    },
+    {
+      "name": "addcash",
+      "description": "Add money to a player.",
+      "usage": "/addcash <player|@group> <amount>",
+      "aliases": []
+    },
+    {
+      "name": "cash",
+      "description": "Set the money of a player.",
+      "usage": "/cash <player|@group> <amount>",
+      "aliases": []
+    },
+    {
+      "name": "give",
+      "description": "Give a weapon / item.",
+      "usage": "/give <player|@ct|@t|@all> <weapon>",
+      "aliases": []
+    },
+    {
+      "name": "gag",
+      "description": "Gag a player (no chat).",
+      "usage": "/gag <player> [minutes] [reason]",
+      "aliases": [
+        "gagid"
+      ]
+    },
+    {
+      "name": "addgag",
+      "description": "Gag a player (no chat) (offline, by SteamID64).",
+      "usage": "/addgag <steamid64> [minutes] [reason]",
+      "aliases": []
+    },
+    {
+      "name": "ungag",
+      "description": "Remove a gag.",
+      "usage": "/ungag <player|steamid64>",
+      "aliases": []
+    },
+    {
+      "name": "oungag",
+      "description": "Remove a gag (offline, by SteamID64).",
+      "usage": "/oungag <steamid64>",
+      "aliases": []
+    },
+    {
+      "name": "mute",
+      "description": "Mute a player (no voice).",
+      "usage": "/mute <player> [minutes] [reason]",
+      "aliases": [
+        "muteid"
+      ]
+    },
+    {
+      "name": "addmute",
+      "description": "Mute a player (no voice) (offline, by SteamID64).",
+      "usage": "/addmute <steamid64> [minutes] [reason]",
+      "aliases": []
+    },
+    {
+      "name": "unmute",
+      "description": "Remove a mute.",
+      "usage": "/unmute <player|steamid64>",
+      "aliases": []
+    },
+    {
+      "name": "ounmute",
+      "description": "Remove a mute (offline, by SteamID64).",
+      "usage": "/ounmute <steamid64>",
+      "aliases": []
+    },
+    {
+      "name": "ban",
+      "description": "Ban a player (the player is only kicked).",
+      "usage": "/ban <player> [minutes] [reason]",
+      "aliases": [
+        "banid"
+      ]
+    },
+    {
+      "name": "unban",
+      "description": "Unban (bans only kick, so nothing is stored).",
+      "usage": "/unban <steamid64>",
+      "aliases": []
+    },
+    {
+      "name": "votekick",
+      "description": "Start a team vote kick.",
+      "usage": "/votekick <player>",
+      "aliases": []
+    },
+    {
+      "name": "f1",
+      "description": "Vote YES.",
+      "usage": "/f1",
+      "aliases": []
+    },
+    {
+      "name": "f2",
+      "description": "Vote NO.",
+      "usage": "/f2",
+      "aliases": []
+    },
+    {
+      "name": "admincmd",
+      "description": "Command menu: pick a command to use.",
+      "usage": "/admincmd",
+      "aliases": []
+    },
+    {
+      "name": "addadmin",
+      "description": "Add an admin.",
+      "usage": "/addadmin [player|steamid64]",
+      "aliases": []
+    },
+    {
+      "name": "adminsp",
+      "description": "Manage admins: enable, tag, permissions.",
+      "usage": "/adminsp",
+      "aliases": []
+    },
+    {
+      "name": "cmds",
+      "description": "List the commands you can use.",
+      "usage": "/cmds",
+      "aliases": []
+    }
+  ],
+  "configs": [
+    "configs/plugins/ServerCommands/ServerCommands.json",
+    "configs/admins.json",
+    "configs/ServerCommandsAdmins.json"
+  ]
+}

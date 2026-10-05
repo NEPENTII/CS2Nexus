@@ -1130,6 +1130,7 @@ sync_shared_all() {
         fi
         sync_shared_current || rc=1
     done
+    ((DRY_RUN)) || aliases_deploy quiet
     unlock_ops
     return $rc
 }
@@ -4291,6 +4292,263 @@ plugin_defaults_ui() {
     done
 }
 
+# ---------- plugin settings: info + commands + aliases ----------
+readonly ALIAS_DB="$SHARED_DIR/command-aliases.json"
+readonly ALIAS_PLUGIN="NexusCommands"
+
+# plugin.json (optional, shipped inside the plugin folder): name, version, author, description, commands[], configs[]
+plugin_manifest() {   # <plugin dir> <jq filter>
+    local f="$1/plugin.json"
+    [[ -f $f ]] || return 0
+    jq -r "$2" "$f" 2>/dev/null
+}
+
+# commands of a plugin: from plugin.json, otherwise every css_* word found in its DLLs
+plugin_commands() {   # <plugin dir> -> lines "name<TAB>description"
+    local d=$1 f out=""
+    if [[ -f $d/plugin.json ]] && jq -e '(.commands // []) | length > 0' "$d/plugin.json" >/dev/null 2>&1; then
+        jq -r '.commands[] | [ (.name | sub("^css_";"")), (.description // "") ] | @tsv' "$d/plugin.json" 2>/dev/null
+        return 0
+    fi
+    while IFS= read -r f; do
+        out+=$(
+            { LC_ALL=C grep -aoE 'css_[a-z0-9_]{2,32}' -- "$f" 2>/dev/null
+              tr -d '\000' <"$f" 2>/dev/null | LC_ALL=C grep -aoE 'css_[a-z0-9_]{2,32}' 2>/dev/null; } | sort -u
+        )$'\n'
+    done < <(find "$d" -maxdepth 1 -type f -name '*.dll' 2>/dev/null)
+    printf '%s\n' "$out" | awk 'NF && !s[$0]++' | sort | while IFS= read -r f; do printf '%s\t\n' "${f#css_}"; done
+}
+
+alias_db_ok() {
+    [[ -f $ALIAS_DB ]] || { printf '{}\n' >"$ALIAS_DB" 2>/dev/null || return 1; }
+    jq -e 'type=="object"' "$ALIAS_DB" >/dev/null 2>&1 || { err "$ALIAS_DB is not a valid JSON object; fix or delete it."; return 1; }
+}
+
+alias_valid_name() { [[ $1 =~ ^[a-z0-9_]{1,32}$ ]]; }
+
+# Writes the alias table of ALL plugins into every server's NexusCommands config and asks running servers to reload it.
+aliases_deploy() {   # [quiet]
+    local id table cfgdir cfg cur tmp n=0 reloaded=0
+    [[ -f $ALIAS_DB ]] && jq -e 'type=="object"' "$ALIAS_DB" >/dev/null 2>&1 || return 0
+    table=$(jq -c '{
+        Aliases: ([ .[]? | .[]? | select((.alias // "") != "" and (.command // "") != "") | {key: .alias, value: .command} ] | from_entries),
+        DisabledOriginals: ([ .[]? | .[]? | select(.disable == true) | .command ] | unique)
+    }' "$ALIAS_DB" 2>/dev/null) || return 1
+    while IFS= read -r id; do
+        load_server "$id" || continue
+        safe_server_path "$S_PATH" "$S_SLUG" || continue
+        cfgdir="$S_PATH/$CSGOREL/addons/counterstrikesharp/configs/plugins/$ALIAS_PLUGIN"
+        cfg="$cfgdir/$ALIAS_PLUGIN.json"
+        [[ -L $cfg || -L $cfgdir ]] && continue
+        mkdir -p -- "$cfgdir" || continue
+        cur='{}'; [[ -f $cfg ]] && cur=$(jq -c 'if type=="object" then . else {} end' "$cfg" 2>/dev/null || echo '{}')
+        tmp=$(mktemp "$cfgdir/.alias.XXXXXX") || continue
+        if jq -n --argjson cur "$cur" --argjson t "$table" '($cur + {ConfigVersion: ($cur.ConfigVersion // 1)}) + $t' >"$tmp" 2>/dev/null; then
+            mv -f -- "$tmp" "$cfg" && chown -R -P -h "$CS2_USER:$CS2_GROUP" -- "$cfgdir" 2>/dev/null
+            n=$((n + 1))
+            if is_running "$id" && console_send "$id" "css_nexus_reload" >/dev/null 2>&1; then reloaded=$((reloaded + 1)); fi
+        else
+            rm -f -- "$tmp"
+        fi
+    done < <(jq -r '.[].id' "$DB")
+    [[ ${1:-} == quiet ]] || info "Command aliases written for $n server(s); $reloaded running server(s) asked to reload."
+    return 0
+}
+
+plugin_has_nexuscommands() {
+    jq -e --arg n "$ALIAS_PLUGIN" 'any(.[]; type=="object" and ((.name // "") == $n))' "$SHARED_DB" >/dev/null 2>&1
+}
+
+plugin_commands_ui() {   # <plugin name> <plugin dir>
+    local pname=$1 pdir=$2 c cmd al i n
+    local -a cmds=()
+    alias_db_ok || return
+    while :; do
+        header "COMMANDS: $pname"
+        plugin_has_nexuscommands || {
+            warn "The '$ALIAS_PLUGIN' plugin is not installed, so renamed commands will not work yet."
+            warn "Install it from Plugins -> Plugin Browser (add NexusCommands.zip to the plugins folder of your GitHub repo)."
+            echo
+        }
+        cmds=()
+        i=0
+        while IFS=$'\t' read -r cmd _; do
+            [[ -n $cmd ]] || continue
+            i=$((i + 1)); cmds[i]=$cmd
+            al=$(jq -r --arg p "$pname" --arg c "$cmd" '[ (.[$p] // [])[] | select(.command == $c) | (.alias + (if .disable == true then " (original disabled)" else "" end)) ] | join(", ")' "$ALIAS_DB" 2>/dev/null)
+            printf '  %2d) !%-18s %s\n' "$i" "$cmd" "${al:+ also: !${al//, /, !}}"
+        done < <(plugin_commands "$pdir")
+        ((i == 0)) && echo "  (no commands found in this plugin)"
+        echo
+        echo "  Type a command number to give it another name (alias)."
+        echo "  r = remove an alias   d = disable/enable the original name of a command"
+        echo "  n = add an alias for a command that is not listed   b = back"
+        read -r -p "Select: " c || exit 0
+        c=$(trim "$c")
+        case $c in
+            b|B|q|Q) return ;;
+            n|N)
+                ask "Command name (without ! or css_)" "" || continue
+                cmd=${ANSWER,,}; cmd=${cmd#!}; cmd=${cmd#css_}
+                alias_valid_name "$cmd" || { err "Use letters, digits and _ only."; sleep 1; continue; }
+                ask "New name (without !)" "" || continue
+                al=${ANSWER,,}; al=${al#!}; al=${al#css_}
+                alias_valid_name "$al" || { err "Use letters, digits and _ only."; sleep 1; continue; }
+                [[ $al != "$cmd" ]] || { err "The new name must be different."; sleep 1; continue; }
+                alias_add "$pname" "$cmd" "$al" ;;
+            r|R)
+                ask "Alias to remove (without !)" "" || continue
+                al=${ANSWER,,}; al=${al#!}
+                alias_remove "$pname" "$al" ;;
+            d|D)
+                ask "Command number" "" || continue
+                [[ $ANSWER =~ ^[0-9]+$ ]] && ((10#$ANSWER >= 1 && 10#$ANSWER <= i)) || { err "Invalid number."; sleep 1; continue; }
+                alias_toggle_disable "$pname" "${cmds[10#$ANSWER]}" ;;
+            *)
+                [[ $c =~ ^[0-9]+$ ]] && ((10#$c >= 1 && 10#$c <= i)) || { err "Invalid option."; sleep 1; continue; }
+                cmd=${cmds[10#$c]}
+                ask "New name for !$cmd (without !)" "" || continue
+                al=${ANSWER,,}; al=${al#!}; al=${al#css_}
+                alias_valid_name "$al" || { err "Use letters, digits and _ only."; sleep 1; continue; }
+                [[ $al != "$cmd" ]] || { err "The new name must be different."; sleep 1; continue; }
+                alias_add "$pname" "$cmd" "$al"
+                if confirm_yn "Disable the original name !$cmd (best effort)? [y/N]: " n; then alias_toggle_disable "$pname" "$cmd" force; fi ;;
+        esac
+    done
+}
+
+alias_add() {   # <plugin> <command> <alias>
+    local p=$1 cmd=$2 al=$3
+    if jq -e --arg a "$al" 'any(.[]?[]?; .alias == $a)' "$ALIAS_DB" >/dev/null 2>&1; then
+        err "The name !$al is already used as an alias."; sleep 1; return 1
+    fi
+    lock_ops 30 || return 1
+    json_update "$ALIAS_DB" --arg p "$p" --arg c "$cmd" --arg a "$al" \
+        '.[$p] = ((.[$p] // []) + [{command:$c, alias:$a, disable:false}])' >/dev/null || { unlock_ops; return 1; }
+    unlock_ops
+    ok "!$al now runs !$cmd."
+    aliases_deploy
+}
+
+alias_remove() {   # <plugin> <alias>
+    local p=$1 al=$2
+    jq -e --arg p "$p" --arg a "$al" 'any((.[$p] // [])[]; .alias == $a)' "$ALIAS_DB" >/dev/null 2>&1 || { err "No such alias."; sleep 1; return 1; }
+    lock_ops 30 || return 1
+    json_update "$ALIAS_DB" --arg p "$p" --arg a "$al" \
+        '.[$p] = [ (.[$p] // [])[] | select(.alias != $a) ] | if (.[$p] | length) == 0 then del(.[$p]) else . end' >/dev/null || { unlock_ops; return 1; }
+    unlock_ops
+    ok "Alias !$al removed."
+    aliases_deploy
+}
+
+alias_toggle_disable() {   # <plugin> <command> [force-on]
+    local p=$1 cmd=$2 force=${3:-}
+    jq -e --arg p "$p" --arg c "$cmd" 'any((.[$p] // [])[]; .command == $c)' "$ALIAS_DB" >/dev/null 2>&1 \
+        || { err "Give !$cmd an alias first (the original can only be disabled when another name exists)."; sleep 2; return 1; }
+    lock_ops 30 || return 1
+    json_update "$ALIAS_DB" --arg p "$p" --arg c "$cmd" --arg f "$force" \
+        '.[$p] = [ (.[$p] // [])[] | if .command == $c then .disable = (if $f == "force" then true else ((.disable // false) | not) end) else . end ]' >/dev/null || { unlock_ops; return 1; }
+    unlock_ops
+    ok "Original name of !$cmd updated."
+    aliases_deploy
+}
+
+plugin_info_screen() {   # <registry path> <name>
+    local rel=$1 name=$2 src c ver source files desc author cfgs line f
+    validate_plugin_rel "$rel" || return
+    src=$(plugin_src_path "$PLUGIN_REL")
+    while :; do
+        header "PLUGIN: $name"
+        ver=$(jq -r --arg p "$rel" '[.[] | select(type=="object" and .path == $p) | (.dllver // "")][0] // ""' "$SHARED_DB")
+        source=$(jq -r --arg p "$rel" '[.[] | select(type=="object" and .path == $p) | (.source // "manual")][0] // "manual"' "$SHARED_DB")
+        [[ -n $(plugin_manifest "$src" '.version // empty') ]] && ver=$(plugin_manifest "$src" '.version // empty')
+        desc=$(plugin_manifest "$src" '.description // empty')
+        author=$(plugin_manifest "$src" '.author // empty')
+        files=$(find "$src" -type f 2>/dev/null | wc -l)
+        printf '  Name        : %s\n' "$name"
+        printf '  Version     : %s\n' "${ver:-unknown}"
+        [[ -n $author ]] && printf '  Author      : %s\n' "$author"
+        [[ -n $desc ]] && printf '  About       : %s\n' "$desc"
+        printf '  Source      : %s\n' "$source"
+        printf '  Files       : %s (%s)\n' "$files" "$(du -sh -- "$src" 2>/dev/null | cut -f1)"
+        printf '  Shared copy : %s\n' "$src"
+        printf '  Servers     : %s\n' "$(jq -r --arg p "$rel" '[.[] | select(type=="object" and .path == $p)][0] | if ((.include // []) | length) > 0 then "only IDs " + (.include | map(tostring) | join(",")) elif ((.exclude // []) | length) > 0 then "all except IDs " + (.exclude | map(tostring) | join(",")) else "all servers" end' "$SHARED_DB")"
+        printf '  Per-server  : %s\n' "$(jq -r --arg p "$rel" '[.[] | select(type=="object" and .path == $p)][0] | ((.local // []) | if length > 0 then join(", ") else "none (data shared)" end)' "$SHARED_DB")"
+        echo
+        echo "  Commands:"
+        local any=0
+        while IFS=$'\t' read -r c line; do
+            [[ -n $c ]] || continue
+            any=1
+            f=$(jq -r --arg p "$name" --arg c "$c" '[ (.[$p] // [])[]? | select(.command == $c) | .alias ] | join(", !")' "$ALIAS_DB" 2>/dev/null)
+            printf '    !%-16s %s%s\n' "$c" "$line" "${f:+  [also: !$f]}"
+        done < <(plugin_commands "$src")
+        ((any)) || echo "    (none found)"
+        echo
+        cfgs=$(plugin_manifest "$src" '(.configs // [])[]')
+        [[ -n $cfgs ]] && { echo "  Config files (inside each server's addons/counterstrikesharp):"; while IFS= read -r f; do echo "    $f"; done <<<"$cfgs"; echo; }
+        echo "  1) Commands: rename / add names"
+        echo "  2) Edit this plugin's config file"
+        echo "  3) Assignment and data mode (servers, per-server data)"
+        echo "  4) Back"
+        read -r -p "Select: " c || exit 0
+        case "$(trim "$c")" in
+            1) alias_db_ok && plugin_commands_ui "$name" "$src" ;;
+            2) plugin_edit_config "$name" ;;
+            3) plugin_edit_registry "$PLUGIN_REL"; pause ;;
+            4|q|Q|b|B) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+plugin_edit_config() {   # <plugin name>
+    local name=$1 id dir f n=0 ed
+    local -a files=() ids=()
+    echo
+    while IFS= read -r id; do
+        load_server "$id" || continue
+        dir="$S_PATH/$CSGOREL/addons/counterstrikesharp/configs/plugins/$name"
+        [[ -d $dir ]] || continue
+        while IFS= read -r f; do
+            n=$((n + 1)); files[n]=$f
+            printf '  %2d) [%s] %s\n' "$n" "$S_NAME" "${f#"$S_PATH/$CSGOREL/addons/counterstrikesharp/configs/"}"
+        done < <(find "$dir" -maxdepth 2 -type f \( -name '*.json' -o -name '*.cfg' -o -name '*.ini' -o -name '*.txt' \) 2>/dev/null | sort)
+    done < <(jq -r '.[].id' "$DB")
+    if ((n == 0)); then
+        warn "No config files yet. A plugin creates its config the first time it loads (start a server with it)."
+        return
+    fi
+    ask "File number (q = cancel)" || return
+    [[ $ANSWER =~ ^[0-9]+$ ]] && ((10#$ANSWER >= 1 && 10#$ANSWER <= n)) || { err "Invalid selection."; sleep 1; return; }
+    f=${files[10#$ANSWER]}
+    [[ -L $f ]] && { err "Refusing to edit a symlink."; return; }
+    ed=${EDITOR:-}; [[ -n $ed ]] || { command -v nano >/dev/null 2>&1 && ed="nano" || ed="vi"; }
+    cp -a -- "$f" "$f.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+    "$ed" -- "$f"
+    chown "$CS2_USER:$CS2_GROUP" -- "$f" 2>/dev/null
+    info "Saved. Restart the server (or reload the plugin) for config changes to apply."
+}
+
+plugin_settings_ui() {
+    local total i=0 idx P_NAME P_PATH P_LOCAL P_EXCL P_INCL dv
+    local -a paths=() names=()
+    header "PLUGIN SETTINGS"
+    shared_db_ok || return
+    total=$(jq 'length' "$SHARED_DB")
+    if ((total == 0)); then warn "No plugins installed."; return; fi
+    while IFS=$'\t' read -r P_NAME P_PATH P_LOCAL P_EXCL P_INCL; do
+        i=$((i + 1)); paths[i]=$P_PATH; names[i]=$P_NAME
+        dv=$(jq -r --arg p "$P_PATH" '[.[] | select(type=="object" and .path == $p) | (.dllver // "")][0] // ""' "$SHARED_DB")
+        printf '%2s) %-24s %s\n' "$i" "$P_NAME" "${dv:+v$dv}"
+    done < <(plugins_rows)
+    echo
+    ask "Plugin number (q = cancel)" || { info "Cancelled."; return; }
+    [[ $ANSWER =~ ^[0-9]+$ ]] && ((10#$ANSWER >= 1 && 10#$ANSWER <= i)) || { err "Invalid selection."; return; }
+    idx=$((10#$ANSWER))
+    plugin_info_screen "${paths[idx]}" "${names[idx]}"
+}
+
 plugins_menu() {
     local c pre
     while :; do
@@ -4312,7 +4570,8 @@ plugins_menu() {
         echo " 8) Sync all servers (also registers plugins from the drop folders)"
         echo " 9) Sync all servers (dry-run)"
         echo "10) Default plugin options"
-        echo "11) Back"
+        echo "11) Plugin settings & commands (info, rename commands, config)"
+        echo "12) Back"
         echo
         read -r -p "Select: " c || exit 0
         case "$(trim "$c")" in
@@ -4326,7 +4585,8 @@ plugins_menu() {
             8) shared_sync_ui 0;      pause ;;
             9) shared_sync_ui 1;      pause ;;
             10) plugin_defaults_ui ;;
-            11|q|Q) return ;;
+            11) plugin_settings_ui ;;
+            12|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
