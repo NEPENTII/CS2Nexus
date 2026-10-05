@@ -1362,7 +1362,7 @@ shared_list_ui() {
         printf '   Per-server   : %s\n' "$([[ $P_LOCAL == - ]] && echo none || echo "$P_LOCAL")"
         printf '   Only on IDs  : %s\n' "$([[ $P_INCL == - ]] && echo 'all servers' || echo "$P_INCL")"
         printf '   Excluded IDs : %s\n' "$([[ $P_EXCL == - ]] && echo none || echo "$P_EXCL")"
-        printf '   Source       : %s\n' "$(jq -r --arg p "$P_PATH" '[.[] | select(type=="object" and .path == $p) | ((.source // "manual") + (if .version then " @ " + .version else "" end))][0] // "manual"' "$SHARED_DB")"
+        printf '   Source       : %s\n' "$(jq -r --arg p "$P_PATH" '[.[] | select(type=="object" and .path == $p) | ((.source // "manual") + (if (.dllver // "") != "" then "  (v" + .dllver + ")" else "" end))][0] // "manual"' "$SHARED_DB")"
         line=""
         haslocal=0; [[ $P_LOCAL != - ]] && haslocal=1
         for id in "${ids[@]}"; do
@@ -3649,6 +3649,25 @@ plugin_profile_local() {   # <name> -> csv | -
     echo "${d:--}"
 }
 
+# Version written inside a plugin: version.txt / VERSION, otherwise the first x.y.z string in its DLL
+# (CounterStrikeSharp's ModuleVersion). Display only; updates are detected by the GitHub file fingerprint.
+plugin_embedded_version() {   # <plugin dir> -> version | (empty)
+    local d=$1 name f v
+    name=${d##*/}
+    for f in "$d/version.txt" "$d/VERSION"; do
+        if [[ -f $f ]]; then
+            v=$(head -n 1 -- "$f" 2>/dev/null | tr -d '\r' | grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -n 1)
+            [[ -n $v ]] && { printf '%s' "$v"; return 0; }
+        fi
+    done
+    f="$d/$name.dll"
+    [[ -f $f ]] || f=$(find "$d" -maxdepth 1 -type f -name '*.dll' 2>/dev/null | head -n 1)
+    [[ -n $f && -f $f ]] || return 0
+    v=$(tr -d '\000' <"$f" 2>/dev/null | LC_ALL=C grep -aoP '(?<![0-9.v])[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(\.[0-9]{1,3})?(?![0-9.])' 2>/dev/null \
+        | awk '$0 !~ /^0\.0\.0/ && $0 !~ /^127\./ && $0 !~ /^255\./' | head -n 1)
+    printf '%s' "$v"
+}
+
 # ---------- catalog ----------
 nexus_catalog_load() {
     local json name type url sha base ext repo tag key
@@ -3670,7 +3689,13 @@ nexus_catalog_load() {
             esac
             valid_simple_name "$base" || continue
             key="nexus:$base"
-            NX_KEYS+=("$key"); NX_LABEL[$key]=$base; NX_KIND[$key]=$ext; NX_URL[$key]=$url; NX_VER[$key]=$sha
+            if [[ -n ${NX_KIND[$key]+x} ]]; then
+                # same plugin as .dll and .zip/folder: keep the package, drop the bare dll
+                [[ $ext == dll ]] && continue
+            else
+                NX_KEYS+=("$key")
+            fi
+            NX_LABEL[$key]=$base; NX_KIND[$key]=$ext; NX_URL[$key]=$url; NX_VER[$key]=$sha
         done < <(jq -r '.[] | [.name, .type, (.download_url // .url // ""), (.sha // "")] | @tsv' <<<"$json")
     else
         NX_NOTE="The plugins folder of github.com/$NEXUS_REPO could not be read (folder missing, private repo, offline or rate limit)."
@@ -3901,7 +3926,7 @@ plugin_backup_old() {   # <name> <src>
 
 # plugin_install_staged <key> <stage> <interactive 0|1>   (uses STAGED_NAME)
 plugin_install_staged() {
-    local key=$1 stage=$2 inter=${3:-1} name rel src new old existing=0 ver prof mode
+    local key=$1 stage=$2 inter=${3:-1} name rel src new old existing=0 ver prof mode dv
     name=$STAGED_NAME; ver=${NX_VER[$key]:-}
     rel="counterstrikesharp/plugins/$name"; src=$(plugin_src_path "$rel")
     shared_path_ok "$src" || { err "Unsafe shared path for '$name'."; return 1; }
@@ -3925,9 +3950,10 @@ plugin_install_staged() {
             unlock_ops; return 1
         fi
         if [[ -e $old ]] && shared_path_ok "$old"; then rm -rf --one-file-system -- "$old"; fi
-        shared_update --arg p "$rel" --arg s "$key" --arg v "$ver" \
-            'map(if .path == $p then .source = $s | .version = $v else . end)' >/dev/null
-        ok "$name updated (version $ver)."
+        dv=$(plugin_embedded_version "$src")
+        shared_update --arg p "$rel" --arg s "$key" --arg v "$ver" --arg dv "$dv" \
+            'map(if .path == $p then .source = $s | .version = $v | .dllver = $dv else . end)' >/dev/null
+        ok "$name updated${dv:+ to v$dv} (package $(printf '%s' "$ver" | cut -c1-7))."
     else
         if [[ -e $src || -L $src ]]; then
             err "A folder named '$name' already exists in the shared folder but is not registered. Remove or rename it first."
@@ -3947,11 +3973,12 @@ plugin_install_staged() {
             shared_path_ok "$src" && rm -rf --one-file-system -- "$src"
             unlock_ops; return 1
         fi
-        if ! shared_update --arg n "$name" --arg p "$rel" --arg s "$key" --arg v "$ver" \
+        dv=$(plugin_embedded_version "$src")
+        if ! shared_update --arg n "$name" --arg p "$rel" --arg s "$key" --arg v "$ver" --arg dv "$dv" \
             --argjson l "$(json_from_csv "$OPT_LOCAL_CSV" strings)" \
             --argjson x "$(json_from_csv "$OPT_EXCL_CSV" numbers)" \
             --argjson i "$(json_from_csv "$OPT_INCL_CSV" numbers)" \
-            '. += [{name:$n, path:$p, source:$s, version:$v}
+            '. += [{name:$n, path:$p, source:$s, version:$v, dllver:$dv}
                    + (if ($l|length) > 0 then {local:$l} else {} end)
                    + (if ($x|length) > 0 then {exclude:$x} else {} end)
                    + (if ($i|length) > 0 then {include:$i} else {} end)]'; then
@@ -3959,7 +3986,7 @@ plugin_install_staged() {
             shared_path_ok "$src" && rm -rf --one-file-system -- "$src"
             unlock_ops; return 1
         fi
-        ok "Plugin '$name' installed."
+        ok "Plugin '$name' installed${dv:+ (v$dv)}."
     fi
     seed_extras "$stage"
     if ! ((DEFER_SYNC)); then
@@ -4004,32 +4031,64 @@ plugin_post_update_action() {   # <names...>
     done < <(jq -r '.[].id' "$DB")
 }
 
+# Plugins that were added by hand / dropped into the folder have no source. When a plugin with the same
+# name exists in the CS2Nexus catalog it is linked to it, so it can be updated too.
+plugins_adopt_untracked() {   # <quiet 0|1>
+    local path name key k adopted=0 rel
+    while IFS=$'\t' read -r path name; do
+        [[ -n $path ]] || continue
+        key=""
+        for k in "${NX_KEYS[@]}"; do [[ ${NX_LABEL[$k],,} == "${name,,}" || ${NX_LABEL[$k],,} == "${path##*/}" ]] && { key=$k; break; }; done
+        [[ -n $key ]] || continue
+        if ((${1:-0})); then
+            info "$name has no update source; it exists in CS2Nexus. Run 'Update plugins now' once to link it."
+            continue
+        fi
+        if confirm_yn "'$name' was added manually but exists in CS2Nexus. Link it to CS2Nexus and update it to the GitHub version? [Y/n]: " y; then
+            rel=$path
+            shared_update --arg p "$rel" --arg s "$key" \
+                'map(if .path == $p then .source = $s | .version = "" else . end)' >/dev/null && adopted=$((adopted + 1))
+        fi
+    done < <(jq -r '.[] | select(type=="object" and ((.source // "") == "")) | [.path, (.name // "")] | @tsv' "$SHARED_DB")
+    return 0
+}
+
 plugins_update_run() {   # <quiet 0|1>
-    local path source ver key name stage checked=0 updated=0 failed=0
+    local path source ver key name stage checked=0 updated=0 failed=0 olddv newdv src
     local -a names=()
     shared_db_ok || return 1
     if ! lock_ops 0; then info "Manager busy; plugin update skipped."; return 0; fi
     if ! nexus_catalog_load; then
         ((${1:-0})) || warn "${NX_NOTE:-No plugin sources reachable.}"
+        ((${1:-0})) || gh_hint
         unlock_ops; return 1
     fi
+    plugins_adopt_untracked "${1:-0}"
     DEFER_SYNC=1
-    while IFS=$'\t' read -r path source ver; do
+    while IFS=$'\t' read -r path source ver olddv; do
         key=$source
         name=${path##*/}
+        [[ $ver == "-" ]] && ver=""
+        [[ $olddv == "-" ]] && olddv=""
         if [[ -z ${NX_VER[$key]+x} ]]; then warn "$name: no longer available from its source; skipped."; continue; fi
         checked=$((checked + 1))
-        [[ ${NX_VER[$key]} == "$ver" ]] && continue
-        info "Updating $name ..."
+        if [[ ${NX_VER[$key]} == "$ver" ]]; then
+            ((${1:-0})) || ok "$name${olddv:+  v$olddv}: up to date."
+            continue
+        fi
+        info "$name: a new package was found on GitHub (installed ${ver:0:7}, GitHub ${NX_VER[$key]:0:7}). Updating ..."
         stage=$(mktemp -d /tmp/cs2nexus.XXXXXX) || { failed=$((failed + 1)); continue; }
-        if nexus_fetch_stage "$key" "$stage" && [[ $STAGED_NAME == "$name" ]] && plugin_install_staged "$key" "$stage" 0; then
+        if nexus_fetch_stage "$key" "$stage" && [[ ${STAGED_NAME,,} == "${name,,}" ]] && plugin_install_staged "$key" "$stage" 0; then
             updated=$((updated + 1)); names+=("$name")
+            src=$(plugin_src_path "counterstrikesharp/plugins/$name")
+            newdv=$(plugin_embedded_version "$src")
+            [[ -n $olddv || -n $newdv ]] && info "$name: ${olddv:-?} -> ${newdv:-?}"
         else
-            [[ $STAGED_NAME != "$name" && -n $STAGED_NAME ]] && err "$name: the new package contains '$STAGED_NAME' instead; not installed."
+            [[ -n $STAGED_NAME && ${STAGED_NAME,,} != "${name,,}" ]] && err "$name: the new package contains '$STAGED_NAME' instead; not installed."
             failed=$((failed + 1))
         fi
         rm -rf --one-file-system -- "$stage"
-    done < <(jq -r '.[] | select(type=="object" and ((.source // "") != "")) | [.path, .source, (.version // "")] | @tsv' "$SHARED_DB")
+    done < <(jq -r '.[] | select(type=="object" and ((.source // "") != "")) | [.path, .source, (if (.version // "") == "" then "-" else .version end), (if (.dllver // "") == "" then "-" else .dllver end)] | @tsv' "$SHARED_DB")
     DEFER_SYNC=0
     if ((updated > 0)); then
         DRY_RUN=0
@@ -4123,7 +4182,7 @@ plugin_browser_ui() {
             i=$((i + 1))
             iv=$(jq -r --arg s "$key" '[.[] | select(type=="object" and .source == $s) | .version][0] // empty' "$SHARED_DB" 2>/dev/null)
             if [[ -z $iv ]]; then state="not installed"
-            elif [[ $iv == "${NX_VER[$key]}" ]]; then state="${GREEN}installed${RESET}"
+            elif [[ $iv == "${NX_VER[$key]}" ]]; then state="${GREEN}installed${RESET}$(jq -r --arg s "$key" '[.[] | select(type=="object" and .source == $s) | (.dllver // "")][0] // "" | if . != "" then "  v" + . else "" end' "$SHARED_DB" 2>/dev/null)"
             else state="${YELLOW}update available${RESET}"; fi
             s=" "; for n in "${sel[@]}"; do [[ $n == "$key" ]] && s="x"; done
             printf '  [%s] %2s) %-26s %-7s %s\n' "$s" "$i" "${NX_LABEL[$key]}" "${NX_KIND[$key]}" "$state"
@@ -4421,7 +4480,7 @@ Usage: $SELF [command]
   broadcast MESSAGE...      send "say MESSAGE" to every running server
   watchdog                  start offline autostart servers (used by the timer)
   plugin-update             update plugins installed from the Plugin Browser (used by the timer)
-  --install                 install the 'cs2' shortcut command
+  --install                 install the 'nexus' command (also 'cs2')
   help                      this text
 
 Exit codes: 0 = ok, 1 = error or skipped items, 2 = usage error.
@@ -4549,18 +4608,37 @@ cli_main() {
 }
 
 # ------------------------------- "cs2" shortcut ------------------------------
-install_command() {
-    local link="/usr/local/bin/cs2" me
-    me=$SELF
-    if [[ -e $link || -L $link ]]; then
-        if [[ -L $link && $(readlink -f -- "$link") == "$me" ]]; then
-            ok "Command 'cs2' is already installed."; return 0
+install_command() {   # [quiet]  -> /usr/local/bin/nexus (+ cs2) point to this launcher
+    local quiet=${1:-} me=$SELF name link cur made=0 fail=0
+    for name in nexus cs2; do
+        link="/usr/local/bin/$name"
+        if [[ -L $link ]]; then
+            cur=$(readlink -f -- "$link" 2>/dev/null || true)
+            [[ $cur == "$me" ]] && continue
+            # an older copy of this launcher: repoint it; anything else is left alone
+            if [[ $(basename -- "$cur") == server-cs2.sh || $(basename -- "$cur") == cs2nexus* ]] || [[ ! -e $cur ]]; then
+                ln -sfn -- "$me" "$link" && made=1 || fail=1
+            else
+                [[ $quiet == quiet ]] || warn "$link points to something else; left unchanged."
+                fail=1
+            fi
+        elif [[ -e $link ]]; then
+            [[ $quiet == quiet ]] || warn "$link exists and is not a link; left unchanged."
+            fail=1
+        else
+            ln -s -- "$me" "$link" && made=1 || fail=1
         fi
-        err "$link already exists and is not this manager. Remove/rename it first."
-        return 1
+    done
+    if [[ $quiet != quiet ]]; then
+        if [[ -L /usr/local/bin/nexus && $(readlink -f -- /usr/local/bin/nexus) == "$me" ]]; then
+            ok "Installed. Type 'nexus' in any terminal to open CS2Nexus."
+        else
+            err "Could not install the 'nexus' command."; return 1
+        fi
+    elif ((made)); then
+        info "Command installed: type 'nexus' in any terminal to open CS2Nexus."
     fi
-    ln -s -- "$me" "$link" || { err "Cannot create $link"; return 1; }
-    ok "Installed. Type 'cs2' in any terminal to open the manager."
+    return 0
 }
 
 # Non-root users: re-run through sudo automatically
@@ -4583,5 +4661,6 @@ if (($# > 0)); then
 fi
 
 preflight menu
+[[ $SELF == /usr/local/bin/* ]] || install_command quiet || true
 ((POST_UPDATE)) && post_update_restart
 main_menu
