@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  CS2NEXUS  -  CS2 SERVER MANAGER / LAUNCHER  -  /opt/server-cs2.sh
+#  CS2NEXUS  -  CS2 SERVER MANAGER / LAUNCHER  -  /opt/nexus.sh
 #  CS2NEXUS-LAUNCHER (marker used by the launcher self-update check)
 #  Ubuntu 22.04 | Counter-Strike 2 dedicated servers | tmux | JSON registry
 #
@@ -18,13 +18,13 @@
 #  and metamod/plugins/<X> can be shared - never any core files.
 #
 #  Usage:
-#    server-cs2.sh                      interactive menu
-#    server-cs2.sh help                 non-interactive commands (cron/systemd)
+#    nexus                              interactive menu (nexus.sh)
+#    nexus help                         non-interactive commands (cron/systemd)
 # =============================================================================
 
 set -u
 set -o pipefail
-# resolve our own path BEFORE changing directory (relative invocations like ./server-cs2.sh)
+# resolve our own path BEFORE changing directory (relative invocations like ./nexus.sh)
 SELF=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
 readonly SELF
 cd / || exit 1
@@ -4898,7 +4898,7 @@ launcher_remote() {
     json=$(gh_api "/repos/$NEXUS_REPO/contents/launcher?ref=$NEXUS_BRANCH" 2>/dev/null) || return 1
     jq -e 'type=="array"' <<<"$json" >/dev/null 2>&1 || return 1
     row=$(jq -r '[.[] | select(.type == "file")] as $f
-        | (($f | map(select(.name == "server-cs2.sh"))[0]) // ($f | map(select(.name == "cs2nexus.sh"))[0]) // ($f | map(select(.name | test("\\.sh$")))[0]))
+        | (($f | map(select(.name == "nexus.sh"))[0]) // ($f | map(select(.name == "server-cs2.sh"))[0]) // ($f | map(select(.name == "cs2nexus.sh"))[0]) // ($f | map(select(.name | test("\\.sh$")))[0]))
         | select(. != null) | [.name, (.download_url // ""), (.sha // "")] | @tsv' <<<"$json")
     [[ -n $row ]] || return 1
     IFS=$'\t' read -r LAUNCHER_FILE LAUNCHER_URL _ <<<"$row"
@@ -5172,7 +5172,7 @@ install_command() {   # [quiet]  -> /usr/local/bin/nexus (+ cs2) point to this l
             cur=$(readlink -f -- "$link" 2>/dev/null || true)
             [[ $cur == "$me" ]] && continue
             # an older copy of this launcher: repoint it; anything else is left alone
-            if [[ $(basename -- "$cur") == server-cs2.sh || $(basename -- "$cur") == cs2nexus* ]] || [[ ! -e $cur ]]; then
+            if [[ $(basename -- "$cur") == server-cs2.sh || $(basename -- "$cur") == nexus.sh || $(basename -- "$cur") == cs2nexus* ]] || [[ ! -e $cur ]]; then
                 ln -sfn -- "$me" "$link" && made=1 || fail=1
             else
                 [[ $quiet == quiet ]] || warn "$link points to something else; left unchanged."
