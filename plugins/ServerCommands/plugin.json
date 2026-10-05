@@ -1,6 +1,6 @@
 {
   "name": "ServerCommands",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "author": "NEPENTII / CS2Nexus",
   "description": "Central admin plugin: admin commands with menus, admin tags (| ADMIN | name), gag/mute, fake bans (kick only), match flow, game modes.",
   "commands": [
@@ -247,24 +247,6 @@
       "name": "admins",
       "description": "Show the online admins.",
       "usage": "/admins",
-      "aliases": []
-    },
-    {
-      "name": "knife",
-      "description": "Currently disabled.",
-      "usage": "/knife",
-      "aliases": []
-    },
-    {
-      "name": "wp",
-      "description": "Currently disabled.",
-      "usage": "/wp",
-      "aliases": []
-    },
-    {
-      "name": "ws",
-      "description": "Currently disabled.",
-      "usage": "/ws",
       "aliases": []
     },
     {
