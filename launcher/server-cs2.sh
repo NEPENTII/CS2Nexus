@@ -1130,7 +1130,7 @@ sync_shared_all() {
         fi
         sync_shared_current || rc=1
     done
-    ((DRY_RUN)) || aliases_deploy quiet
+    ((DRY_RUN)) || { aliases_deploy quiet; admins_deploy_defaults quiet; }
     unlock_ops
     return $rc
 }
@@ -2313,6 +2313,298 @@ maintenance_menu() {
 }
 
 # ------------------------------- Main menu -----------------------------------
+# ---------- admins (launcher view across all servers) ----------
+# In-game /addadmin makes an admin for THAT server only. Here the owner can make an admin a default
+# admin (every server, also servers created later), limit him to chosen servers, edit permissions and tag.
+readonly ADMIN_DEF_DB="$SHARED_DIR/default-admins.json"
+readonly -a ADMIN_PERMS=(
+    "rr|Restart Round" "start|Start Match" "end|End Match" "endwarmup|End Warmup" "startwarmup|Start Warmup"
+    "pausewarmup|Pause Warmup" "pause|Force Pause" "kniferound|Knife Round"
+    "gag|Gag" "ungag|Ungag" "mute|Mute" "unmute|Unmute" "kick|Kick" "ban|Ban (kick only)" "unban|Unban"
+    "slay|Slay" "slap|Slap" "respawn|Respawn" "move|Move Team" "rename|Rename Player" "spectate|Spectate" "plist|Player List"
+    "addcash|Add Cash" "cash|Set Cash" "give|Give Weapons" "bh|BunnyHop" "ff|Friendly Fire" "t|All Talk" "hs|Headshot Only"
+    "casual|Casual" "comp|Competitive" "dm|Deathmatch" "mix|Mix" "aim|Aim" "prac|Practice" "retakes|Retakes" "warmup|Warmup"
+    "map|Change Map" "wmap|Workshop Map" "maxrounds|Max Rounds" "freezetime|Freeze Time" "bot|Bots" "lock|Lock Teams"
+    "rcon|RCON" "asay|Admin Say" "votekick|Vote Kick" "admincmd|Admin Command Menu" "addadmin|Add Admin" "adminsp|Admin Permissions"
+)
+readonly ADMIN_NEW_DEFAULT_PERMS="plist kick gag ungag mute unmute map spectate slap slay respawn move admincmd votekick"
+readonly ADMIN_OWNER_DEFAULT="76561198768187147"
+
+admin_cfgdir() { printf '%s/%s/addons/counterstrikesharp/configs' "$S_PATH" "$CSGOREL"; }
+
+admin_def_ok() {
+    [[ -f $ADMIN_DEF_DB ]] || printf '[]\n' >"$ADMIN_DEF_DB" 2>/dev/null || return 1
+    jq -e 'type=="array"' "$ADMIN_DEF_DB" >/dev/null 2>&1 || { err "$ADMIN_DEF_DB is not a valid JSON array."; return 1; }
+}
+
+admin_owner_ids() {   # first server's plugin config, else the built-in owner
+    local id f oids=""
+    while IFS= read -r id; do
+        load_server "$id" || continue
+        f="$(admin_cfgdir)/plugins/ServerCommands/ServerCommands.json"
+        [[ -f $f ]] && oids=$(jq -r '(.OwnerSteamIds // [])[]' "$f" 2>/dev/null)
+        [[ -n $oids ]] && break
+    done < <(jq -r '.[].id' "$DB")
+    printf '%s\n' "${oids:-$ADMIN_OWNER_DEFAULT}"
+}
+
+# admin_write_server <server id> <identity> <name> <immunity> <tag> <enabled true|false> <flags json array>
+admin_write_server() {
+    local sid=$1 ident=$2 name=$3 im=$4 tag=$5 en=$6 fl=$7 dir meta adm tmp
+    load_server "$sid" || return 1
+    safe_server_path "$S_PATH" "$S_SLUG" || return 1
+    dir=$(admin_cfgdir)
+    [[ -L $dir ]] && return 1
+    mkdir -p -- "$dir" || return 1
+    meta="$dir/ServerCommandsAdmins.json"; adm="$dir/admins.json"
+    [[ -L $meta || -L $adm ]] && return 1
+    [[ -f $meta ]] || printf '[]\n' >"$meta"
+    [[ -f $adm ]] || printf '{}\n' >"$adm"
+    jq -e 'type=="array"' "$meta" >/dev/null 2>&1 || { warn "$S_NAME: ServerCommandsAdmins.json is not valid; skipped."; return 1; }
+    jq -e 'type=="object"' "$adm" >/dev/null 2>&1 || { warn "$S_NAME: admins.json is not valid; skipped."; return 1; }
+    tmp=$(mktemp "$dir/.adm.XXXXXX") || return 1
+    jq --arg id "$ident" --arg n "$name" --argjson im "$im" --arg tag "$tag" --argjson en "$en" --argjson fl "$fl" \
+        '(if any(.[]; .Identity == $id) then map(if .Identity == $id then .Name=$n | .Immunity=$im | .Tag=$tag | .Enabled=$en | .Flags=$fl else . end)
+          else . + [{Identity:$id, Name:$n, Immunity:$im, Flags:$fl, Tag:$tag, Enabled:$en}] end)' "$meta" >"$tmp" \
+        && mv -f -- "$tmp" "$meta" || { rm -f -- "$tmp"; return 1; }
+    tmp=$(mktemp "$dir/.adm.XXXXXX") || return 1
+    jq --arg id "$ident" --arg n "$name" --argjson im "$im" --argjson en "$en" --argjson fl "$fl" \
+        'with_entries(select((.value.identity // "") != $id))
+         | if $en then (. + {((if has($n) then ($n + "_" + $id[-4:]) else $n end)): {identity:$id, immunity:$im, flags:$fl}}) else . end' "$adm" >"$tmp" \
+        && mv -f -- "$tmp" "$adm" || { rm -f -- "$tmp"; return 1; }
+    chown "$CS2_USER:$CS2_GROUP" -- "$meta" "$adm" 2>/dev/null
+    is_running "$sid" && console_send "$sid" "css_sc_reload" >/dev/null 2>&1
+    return 0
+}
+
+admin_remove_server() {   # <server id> <identity>
+    local sid=$1 ident=$2 dir meta adm tmp
+    load_server "$sid" || return 0
+    dir=$(admin_cfgdir); meta="$dir/ServerCommandsAdmins.json"; adm="$dir/admins.json"
+    if [[ -f $meta && ! -L $meta ]] && jq -e 'type=="array"' "$meta" >/dev/null 2>&1; then
+        tmp=$(mktemp "$dir/.adm.XXXXXX") && jq --arg id "$ident" 'map(select(.Identity != $id))' "$meta" >"$tmp" && mv -f -- "$tmp" "$meta" || rm -f -- "$tmp"
+    fi
+    if [[ -f $adm && ! -L $adm ]] && jq -e 'type=="object"' "$adm" >/dev/null 2>&1; then
+        tmp=$(mktemp "$dir/.adm.XXXXXX") && jq --arg id "$ident" 'with_entries(select((.value.identity // "") != $id))' "$adm" >"$tmp" && mv -f -- "$tmp" "$adm" || rm -f -- "$tmp"
+    fi
+    chown "$CS2_USER:$CS2_GROUP" -- "$meta" "$adm" 2>/dev/null
+    is_running "$sid" && console_send "$sid" "css_sc_reload" >/dev/null 2>&1
+    return 0
+}
+
+# Pushes every default admin to every server (or just <sid>), so new servers get them too.
+admins_deploy_defaults() {   # [quiet] [only server id]
+    local quiet=${1:-} only=${2:-} sid row n=0
+    [[ -f $ADMIN_DEF_DB ]] && jq -e 'type=="array" and length > 0' "$ADMIN_DEF_DB" >/dev/null 2>&1 || return 0
+    while IFS= read -r sid; do
+        [[ -n $only && $sid != "$only" ]] && continue
+        while IFS= read -r row; do
+            admin_write_server "$sid" "$(jq -r .identity <<<"$row")" "$(jq -r .name <<<"$row")" "$(jq -r '.immunity // 50' <<<"$row")" \
+                "$(jq -r '.tag // "ADMIN"' <<<"$row")" "$(jq -r '(.enabled // true)' <<<"$row")" "$(jq -c '.flags // []' <<<"$row")" && n=$((n + 1))
+        done < <(jq -c '.[]' "$ADMIN_DEF_DB")
+    done < <(jq -r '.[].id' "$DB")
+    [[ $quiet == quiet ]] || info "Default admins written ($n entries)."
+    return 0
+}
+
+# Fills A_IDS[] and A_NAME/A_TAG/A_EN/A_IM/A_FL (from the first server that has him) and A_SRV (server ids, comma separated)
+declare -A A_NAME=() A_TAG=() A_EN=() A_IM=() A_FL=() A_SRV=() A_DEF=()
+declare -a A_IDS=()
+admins_scan() {
+    local sid f ident
+    A_IDS=(); A_NAME=(); A_TAG=(); A_EN=(); A_IM=(); A_FL=(); A_SRV=(); A_DEF=()
+    while IFS= read -r sid; do
+        load_server "$sid" || continue
+        f="$(admin_cfgdir)/ServerCommandsAdmins.json"
+        [[ -f $f ]] || continue
+        while IFS=$'\t' read -r ident name tag en im fl; do
+            [[ -n $ident ]] || continue
+            if [[ -z ${A_NAME[$ident]+x} ]]; then
+                A_IDS+=("$ident"); A_NAME[$ident]=$name; A_TAG[$ident]=$tag; A_EN[$ident]=$en; A_IM[$ident]=$im; A_FL[$ident]=$fl
+            fi
+            A_SRV[$ident]+="${A_SRV[$ident]:+,}$sid"
+        done < <(jq -r '.[] | [.Identity, (.Name // ""), (.Tag // ""), ((.Enabled // true) | tostring), ((.Immunity // 0) | tostring), ((.Flags // []) | tostring)] | @tsv' "$f" 2>/dev/null)
+    done < <(jq -r '.[].id' "$DB")
+    if [[ -f $ADMIN_DEF_DB ]]; then
+        while IFS= read -r ident; do A_DEF[$ident]=1; done < <(jq -r '.[].identity' "$ADMIN_DEF_DB" 2>/dev/null)
+    fi
+}
+
+admin_scope_arg() { if [[ -n ${A_DEF[$1]+x} ]]; then printf ALL; else printf '%s' "${A_SRV[$1]:-}"; fi; }
+
+admin_scope_text() {   # <identity>
+    local ident=$1 total
+    total=$(jq 'length' "$DB")
+    if [[ -n ${A_DEF[$ident]+x} ]]; then printf 'ALL servers (default admin)'
+    elif [[ -n ${A_SRV[$ident]+x} ]]; then
+        if [[ $(tr ',' '\n' <<<"${A_SRV[$ident]}" | wc -l) -ge $total ]]; then printf 'all servers (set per server)'
+        else printf 'server ID %s only' "${A_SRV[$ident]}"; fi
+    else printf '-'; fi
+}
+
+# keep the default-admin registry in step with a changed admin
+admin_def_set() {   # <identity> <name> <immunity> <tag> <enabled> <flags json>
+    admin_def_ok || return 1
+    json_update "$ADMIN_DEF_DB" --arg id "$1" --arg n "$2" --argjson im "$3" --arg tag "$4" --argjson en "$5" --argjson fl "$6" \
+        '(map(select(.identity != $id))) + [{identity:$id, name:$n, immunity:$im, tag:$tag, enabled:$en, flags:$fl}]' >/dev/null
+}
+admin_def_del() { admin_def_ok && json_update "$ADMIN_DEF_DB" --arg id "$1" 'map(select(.identity != $id))' >/dev/null; }
+
+# apply the stored values of <identity> to all servers that should have him
+admin_push() {   # <identity> <csv of server ids | ALL>
+    local ident=$1 scope=$2 sid
+    local -a ids=()
+    if [[ $scope == ALL ]]; then mapfile -t ids < <(jq -r '.[].id' "$DB"); else IFS=, read -ra ids <<<"$scope"; fi
+    for sid in "${ids[@]}"; do
+        admin_write_server "$sid" "$ident" "${A_NAME[$ident]}" "${A_IM[$ident]}" "${A_TAG[$ident]}" "${A_EN[$ident]}" "${A_FL[$ident]}" \
+            || warn "Server $sid: could not write the admin."
+    done
+    if [[ -n ${A_DEF[$ident]+x} ]]; then admin_def_set "$ident" "${A_NAME[$ident]}" "${A_IM[$ident]}" "${A_TAG[$ident]}" "${A_EN[$ident]}" "${A_FL[$ident]}"; fi
+}
+
+admin_perm_ui() {   # <identity>
+    local ident=$1 c i p label has
+    while :; do
+        header "PERMISSIONS: ${A_NAME[$ident]}"
+        i=0
+        for p in "${ADMIN_PERMS[@]}"; do
+            i=$((i + 1)); label=${p#*|}
+            has=" "; jq -e --arg f "@nepentii/${p%%|*}" 'index($f) != null' <<<"${A_FL[$ident]}" >/dev/null 2>&1 && has="x"
+            printf '  [%s] %2d) %s\n' "$has" "$i" "$label"
+        done
+        echo
+        echo "  Type numbers to toggle (e.g. 1 5 9), a = all, n = none, s = save, b = cancel"
+        read -r -p "Select: " c || exit 0
+        c=$(trim "$c")
+        case $c in
+            b|B|q|Q) return 1 ;;
+            s|S) return 0 ;;
+            a|A) A_FL[$ident]=$(printf '%s\n' "${ADMIN_PERMS[@]}" | jq -R '"@nepentii/" + split("|")[0]' | jq -sc .) ;;
+            n|N) A_FL[$ident]='[]' ;;
+            *)
+                for i in $c; do
+                    [[ $i =~ ^[0-9]+$ ]] && ((10#$i >= 1 && 10#$i <= ${#ADMIN_PERMS[@]})) || continue
+                    p=${ADMIN_PERMS[10#$i - 1]}
+                    A_FL[$ident]=$(jq -c --arg f "@nepentii/${p%%|*}" 'if index($f) != null then map(select(. != $f)) else . + [$f] end' <<<"${A_FL[$ident]}")
+                done ;;
+        esac
+    done
+}
+
+admin_detail_ui() {   # <identity>
+    local ident=$1 c owners sid
+    owners=$(admin_owner_ids)
+    while :; do
+        admins_scan
+        [[ -n ${A_NAME[$ident]+x} || -n ${A_DEF[$ident]+x} ]] || { warn "That admin no longer exists."; return; }
+        [[ -n ${A_NAME[$ident]+x} ]] || { A_NAME[$ident]=$(jq -r --arg i "$ident" '.[]|select(.identity==$i)|.name' "$ADMIN_DEF_DB"); }
+        header "ADMIN: ${A_NAME[$ident]}"
+        printf '  SteamID64   : %s\n' "$ident"
+        printf '  Tag         : %s\n' "${A_TAG[$ident]:-(none)}"
+        printf '  Enabled     : %s\n' "${A_EN[$ident]:-true}"
+        printf '  Servers     : %s\n' "$(admin_scope_text "$ident")"
+        printf '  Permissions : %s\n' "$(jq -r 'length' <<<"${A_FL[$ident]:-[]}") of ${#ADMIN_PERMS[@]}"
+        grep -qx "$ident" <<<"$owners" && printf '  %sOwner: always has every permission and cannot be removed here.%s\n' "$YELLOW" "$RESET"
+        echo
+        echo "  1) Make DEFAULT admin (all servers, also new servers)"
+        echo "  2) Admin only on selected servers"
+        echo "  3) Edit permissions"
+        echo "  4) Change tag"
+        echo "  5) Enable / disable"
+        echo "  6) Remove this admin from all servers"
+        echo "  7) Back"
+        read -r -p "Select: " c || exit 0
+        case "$(trim "$c")" in
+            1) A_DEF[$ident]=1
+               admin_push "$ident" ALL; ok "${A_NAME[$ident]} is now an admin on every server."; pause ;;
+            2) prompt_server_ids "Servers where he is admin" "${A_SRV[$ident]:--}" 1 || continue
+               admin_def_del "$ident"
+               for sid in $(jq -r '.[].id' "$DB"); do
+                   [[ ,$IDS_CSV, == *",$sid,"* ]] || admin_remove_server "$sid" "$ident"
+               done
+               unset 'A_DEF[$ident]'
+               admin_push "$ident" "$IDS_CSV"; ok "Done: admin only on server(s) $IDS_CSV."; pause ;;
+            3) if grep -qx "$ident" <<<"$owners"; then warn "Owners always have everything."; sleep 1; continue; fi
+               if admin_perm_ui "$ident"; then
+                   admin_push "$ident" "$(admin_scope_arg "$ident")"; ok "Permissions saved."; pause
+               fi ;;
+            4) ask "New tag (max 16 characters, empty = none)" "${A_TAG[$ident]}" || continue
+               A_TAG[$ident]=$(printf '%s' "$ANSWER" | tr -d '[]|' | cut -c1-16)
+               admin_push "$ident" "$(admin_scope_arg "$ident")"; ok "Tag saved."; pause ;;
+            5) if grep -qx "$ident" <<<"$owners"; then warn "Owners cannot be disabled."; sleep 1; continue; fi
+               if [[ ${A_EN[$ident]:-true} == true ]]; then A_EN[$ident]=false; else A_EN[$ident]=true; fi
+               admin_push "$ident" "$(admin_scope_arg "$ident")"; ok "Updated."; pause ;;
+            6) if grep -qx "$ident" <<<"$owners"; then warn "Owners cannot be removed."; sleep 1; continue; fi
+               confirm_yn "Remove ${A_NAME[$ident]} from ALL servers? [y/N]: " n || continue
+               admin_def_del "$ident"
+               for sid in $(jq -r '.[].id' "$DB"); do admin_remove_server "$sid" "$ident"; done
+               ok "Removed."; pause; return ;;
+            7|b|B|q|Q) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+admin_add_ui() {
+    local ident name tag="ADMIN" fl
+    ask "SteamID64 of the new admin (q = cancel)" || return
+    ident=$ANSWER
+    [[ $ident =~ ^7656[0-9]{13}$ ]] || { err "That is not a SteamID64 (17 digits starting with 7656)."; return; }
+    ask "Name (for the lists)" "Admin_${ident: -4}" || return
+    name=$(printf '%s' "$ANSWER" | tr -d '"\\' | cut -c1-32)
+    echo
+    echo "  1) Default admin: ALL servers (also servers created later)"
+    echo "  2) Selected servers only"
+    ask "Choice" "2" || return
+    fl=$(printf '%s\n' $ADMIN_NEW_DEFAULT_PERMS | jq -R '"@nepentii/" + .' | jq -sc .)
+    admins_scan
+    A_NAME[$ident]=$name; A_TAG[$ident]=$tag; A_EN[$ident]=true; A_IM[$ident]=50; A_FL[$ident]=$fl
+    if [[ $ANSWER == 1 ]]; then
+        A_DEF[$ident]=1
+        admin_push "$ident" ALL
+        ok "$name is a default admin on every server (basic permissions; change them in the next screen)."
+    else
+        prompt_server_ids "Servers where he is admin" "-" 1 || return
+        admin_push "$ident" "$IDS_CSV"
+        ok "$name is admin on server(s) $IDS_CSV."
+    fi
+    pause
+    admin_detail_ui "$ident"
+}
+
+admins_menu() {
+    local c i idx ident
+    local -a order=()
+    admin_def_ok || { pause; return; }
+    while :; do
+        header "ADMINS"
+        admins_scan
+        for ident in $(jq -r '.[].identity' "$ADMIN_DEF_DB" 2>/dev/null); do
+            [[ -n ${A_NAME[$ident]+x} ]] || { A_IDS+=("$ident"); A_NAME[$ident]=$(jq -r --arg i "$ident" '.[]|select(.identity==$i)|.name' "$ADMIN_DEF_DB"); A_TAG[$ident]=$(jq -r --arg i "$ident" '.[]|select(.identity==$i)|.tag' "$ADMIN_DEF_DB"); }
+        done
+        order=(); i=0
+        if ((${#A_IDS[@]} == 0)); then echo "  No admins yet."; fi
+        for ident in "${A_IDS[@]}"; do
+            i=$((i + 1)); order[i]=$ident
+            printf '  %2d) %-22s %-10s %s\n' "$i" "${A_NAME[$ident]}" "${A_TAG[$ident]:+| ${A_TAG[$ident]} |}" "$(admin_scope_text "$ident")"
+        done
+        echo
+        echo "  Admins added in-game with /addadmin belong to that server only."
+        echo "  Choose a number to make him a default admin (all servers), limit him to chosen servers or edit permissions."
+        echo
+        echo "  a) Add an admin by SteamID64     r) Refresh     b) Back"
+        read -r -p "Select: " c || exit 0
+        c=$(trim "$c")
+        case $c in
+            a|A) admin_add_ui ;;
+            r|R) continue ;;
+            b|B|q|Q) return ;;
+            *) [[ $c =~ ^[0-9]+$ ]] && ((10#$c >= 1 && 10#$c <= i)) || { err "Invalid option."; sleep 1; continue; }
+               idx=$((10#$c)); admin_detail_ui "${order[idx]}" ;;
+        esac
+    done
+}
+
 main_menu() {
     local choice
     while :; do
@@ -2335,7 +2627,8 @@ main_menu() {
         echo "11) Server Console"
         echo "12) Log Viewer"
         echo "13) Maintenance"
-        echo "14) Exit"
+        echo "14) Admins"
+        echo "15) Exit"
         echo
         read -r -p "Select: " choice || exit 0
         case "$(trim "$choice")" in
@@ -2352,7 +2645,8 @@ main_menu() {
             11) console_menu ;;
             12) logs_ui;          pause ;;
             13) maintenance_menu ;;
-            14) clear_screen; echo "Goodbye."; exit 0 ;;
+            14) admins_menu ;;
+            15) clear_screen; echo "Goodbye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -3149,6 +3443,8 @@ create_server_core() {   # <name> <slug> <maxplayers> <port> <map>
         discover_shared_plugins
         sync_shared_current || warn "Some plugins were skipped (see above)."
     fi
+    admins_deploy_defaults quiet "$id"
+    aliases_deploy quiet
     return 0
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "ServerCommands",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "author": "NEPENTII / CS2Nexus",
   "description": "Central admin plugin: admin commands with menus, admin tags (| ADMIN | name), gag/mute, fake bans (kick only), match flow, game modes.",
   "commands": [
@@ -417,6 +417,12 @@
       "name": "cmds",
       "description": "List the commands you can use.",
       "usage": "/cmds",
+      "aliases": []
+    },
+    {
+      "name": "sc_reload",
+      "description": "Reload admins written by the launcher (server console only)",
+      "usage": "css_sc_reload",
       "aliases": []
     }
   ],
