@@ -1,8 +1,8 @@
 {
   "name": "ServerCommands",
-  "version": "4.0.2",
+  "version": "4.1.0",
   "author": "NEPENTII / CS2Nexus",
-  "description": "Central admin plugin: admin commands with menus, admin tags (| ADMIN | name), gag/mute, fake bans (kick only), match flow, game modes.",
+  "description": "Central admin plugin: admin commands with menus, admin tags (| ADMIN | name), gag/mute, real per-server bans, match flow, game modes.",
   "commands": [
     {
       "name": "rr",
@@ -365,7 +365,7 @@
     },
     {
       "name": "ban",
-      "description": "Ban a player (the player is only kicked).",
+      "description": "Ban a player from THIS server (no minutes = permanent). Other servers are not affected.",
       "usage": "/ban <player> [minutes] [reason]",
       "aliases": [
         "banid"
@@ -373,8 +373,14 @@
     },
     {
       "name": "unban",
-      "description": "Unban (bans only kick, so nothing is stored).",
+      "description": "Unban a player on this server (menu lists the banned players).",
       "usage": "/unban <steamid64>",
+      "aliases": []
+    },
+    {
+      "name": "banlist",
+      "description": "Show the banned players of this server.",
+      "usage": "/banlist",
       "aliases": []
     },
     {
