@@ -2605,6 +2605,111 @@ admins_menu() {
     done
 }
 
+# ------------------------------- Live resource monitor -----------------------
+# One screen, every server at once: CPU, RAM, disk. Refreshes by itself.
+mon_snapshot() {   # prints: pid ppid ticks rss_pages  (every process, one awk pass)
+    awk '{ i = index($0, ") "); if (i == 0) next; r = substr($0, i + 2); split(r, a, " ");
+           printf "%s %s %d %s\n", $1, a[2], a[12] + a[13], a[22] }' /proc/[0-9]*/stat 2>/dev/null
+}
+
+# mon_sum <snapshot file> <root pid>  -> "ticks rss_pages" of the root and all its descendants
+mon_sum() {
+    awk -v root="$2" '{ par[$1] = $2; t[$1] = $3; r[$1] = $4 }
+        END { for (p in par) { q = p; n = 0; while (q != "" && q != 0 && n++ < 64) { if (q == root) { T += t[p]; R += r[p]; break } q = par[q] } }
+              printf "%d %d\n", T, R }' "$1"
+}
+
+mon_bar() {   # <percent 0-100> <width>
+    local pct=$1 w=$2 n i out=""
+    n=$(awk -v p="$pct" -v w="$w" 'BEGIN{ if (p > 100) p = 100; if (p < 0) p = 0; printf "%d", p * w / 100 + 0.5 }')
+    for ((i = 0; i < w; i++)); do ((i < n)) && out+="#" || out+="."; done
+    printf '%s' "$out"
+}
+
+mon_color() {   # <percent> -> colour escape
+    awk -v p="$1" -v r="$RED" -v y="$YELLOW" -v g="$GREEN" 'BEGIN{ printf "%s", (p >= 85 ? r : (p >= 60 ? y : g)) }'
+}
+
+monitor_ui() {
+    local interval=2 tick page cores snap now prev_now="" key i
+    local id name path pid sess t r cpu ramkb ramp
+    local -A prev_ticks=() disk_mb=() disk_at=()
+    local cpu_a cpu_b tot_a idle_a tot_b idle_b sys_cpu="0"
+    tick=$(getconf CLK_TCK 2>/dev/null || echo 100); page=$(getconf PAGESIZE 2>/dev/null || echo 4096)
+    cores=$(nproc 2>/dev/null || echo 1)
+    snap=$(mktemp) || return
+    local -a rows=()
+    mapfile -t rows < <(jq -r '.[] | [.id, .name, .path] | @tsv' "$DB" 2>/dev/null)
+    if ((${#rows[@]} == 0)); then warn "No servers yet."; rm -f "$snap"; return; fi
+    printf '\033[?25l'
+    clear_screen
+    read -r tot_a idle_a < <(awk '/^cpu /{ tot = 0; for (i = 2; i <= NF; i++) tot += $i; print tot, $5 + $6 }' /proc/stat)
+    while :; do
+        now=${EPOCHREALTIME/[.,]/}   # microseconds
+        mon_snapshot >"$snap"
+        local memtot memavail memused memp load dfline dfp
+        memtot=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); memavail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+        memused=$((memtot - memavail)); memp=$((memused * 100 / (memtot > 0 ? memtot : 1)))
+        read -r tot_b idle_b < <(awk '/^cpu /{ tot = 0; for (i = 2; i <= NF; i++) tot += $i; print tot, $5 + $6 }' /proc/stat)
+        if ((tot_b > tot_a)); then sys_cpu=$(( (100 * ((tot_b - tot_a) - (idle_b - idle_a))) / (tot_b - tot_a) )); fi
+        tot_a=$tot_b; idle_a=$idle_b
+        load=$(cut -d' ' -f1-3 /proc/loadavg)
+        dfline=$(df -P -BM "$SERVERS_DIR" 2>/dev/null | awk 'NR==2{gsub("M","",$2); gsub("M","",$3); gsub("M","",$4); gsub("%","",$5); print $2, $3, $4, $5}')
+        printf '\033[H'
+        printf '%s  CS2NEXUS - LIVE RESOURCE MONITOR%s   (refresh %ss - press q or Enter to go back)\033[K\n' "$BOLD" "$RESET" "$interval"
+        sep
+        printf '  SYSTEM  CPU %s%3d%%%s [%s]  (%s cores)   load %s\033[K\n' "$(mon_color "$sys_cpu")" "$sys_cpu" "$RESET" "$(mon_bar "$sys_cpu" 20)" "$cores" "$load"
+        printf '          RAM %s%3d%%%s [%s]  %s / %s MB\033[K\n' "$(mon_color "$memp")" "$memp" "$RESET" "$(mon_bar "$memp" 20)" "$((memused / 1024))" "$((memtot / 1024))"
+        if [[ -n $dfline ]]; then
+            read -r dtot dused dfree dfp <<<"$dfline"
+            printf '          DISK%s%3d%%%s [%s]  %s used, %s free (of %s MB)\033[K\n' "$(mon_color "$dfp")" " $dfp" "$RESET" "$(mon_bar "$dfp" 20)" "${dused}M" "${dfree}M" "$dtot"
+        fi
+        sep
+        printf '  %-3s %-18s %-8s %9s  %-22s %-9s %s\033[K\n' "ID" "NAME" "STATUS" "CPU(1 core=100%)" "RAM" "DISK" ""
+        local tc=0 tr=0 td=0 online=0
+        for i in "${!rows[@]}"; do
+            IFS=$'\t' read -r id name path <<<"${rows[i]}"
+            sess=$(session_name "$id")
+            # disk: du is slow, so measure on first sight and then every 60 s
+            if [[ -z ${disk_mb[$id]:-} || $(( (${now%??????} ) - ${disk_at[$id]:-0} )) -ge 60 ]]; then
+                disk_mb[$id]=$(du -sm -- "$path" 2>/dev/null | cut -f1); disk_at[$id]=${now%??????}
+            fi
+            td=$((td + ${disk_mb[$id]:-0}))
+            pid=$(tmux_cs2 list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null | head -n 1)
+            if [[ -z $pid ]]; then
+                printf '  %-3s %-18.18s %s%-8s%s %9s  %-22s %-9s\033[K\n' "$id" "$name" "$RED" "OFFLINE" "$RESET" "-" "-" "$(mon_fmt_mb "${disk_mb[$id]:-0}")"
+                unset 'prev_ticks[$id]'
+                continue
+            fi
+            online=$((online + 1))
+            read -r t r < <(mon_sum "$snap" "$pid")
+            cpu=0
+            if [[ -n ${prev_ticks[$id]:-} && -n $prev_now ]] && ((now > prev_now)); then
+                cpu=$(awk -v d="$((t - ${prev_ticks[$id]%% *}))" -v tk="$tick" -v us="$((now - prev_now))" 'BEGIN{ v = d / tk / (us / 1000000) * 100; if (v < 0) v = 0; printf "%.0f", v }')
+            fi
+            prev_ticks[$id]="$t"
+            ramkb=$((r * page / 1024)); ramp=$((ramkb * 100 / (memtot > 0 ? memtot : 1)))
+            tc=$((tc + cpu)); tr=$((tr + ramkb))
+            printf '  %-3s %-18.18s %s%-8s%s %s%8s%%%s  %s%-8s%s [%s] %-9s\033[K\n' "$id" "$name" "$GREEN" "ONLINE" "$RESET" \
+                "$(mon_color "$((cpu / cores))")" "$cpu" "$RESET" "$(mon_color "$ramp")" "$(mon_fmt_mb "$((ramkb / 1024))")" "$RESET" "$(mon_bar "$ramp" 10)" "$(mon_fmt_mb "${disk_mb[$id]:-0}")"
+        done
+        sep
+        printf '  %s online | total CPU %s%% of 1 core (%s%% of the machine) | total RAM %s | server files %s\033[K\n' "$online" "$tc" "$((tc / cores))" "$(mon_fmt_mb "$((tr / 1024))")" "$(mon_fmt_mb "$td")"
+        printf '  Disk = size of each server folder (shared plugin/base files are links and are not counted).\033[K\n'
+        printf '\033[J'
+        prev_now=$now
+        if read -r -s -n1 -t "$interval" key; then
+            [[ $key == q || $key == Q || -z $key ]] && break
+        fi
+    done
+    rm -f "$snap"
+    printf '\033[?25h'
+}
+
+mon_fmt_mb() {   # <MB> -> 812M / 3.4G
+    awk -v m="${1:-0}" 'BEGIN{ if (m >= 1024) printf "%.1fG", m / 1024; else printf "%dM", m }'
+}
+
 main_menu() {
     local choice
     while :; do
@@ -2628,7 +2733,8 @@ main_menu() {
         echo "12) Log Viewer"
         echo "13) Maintenance"
         echo "14) Admins"
-        echo "15) Exit"
+        echo "15) Resource Monitor (CPU / RAM / disk, live)"
+        echo "16) Exit"
         echo
         read -r -p "Select: " choice || exit 0
         case "$(trim "$choice")" in
@@ -2646,7 +2752,8 @@ main_menu() {
             12) logs_ui;          pause ;;
             13) maintenance_menu ;;
             14) admins_menu ;;
-            15) clear_screen; echo "Goodbye."; exit 0 ;;
+            15) monitor_ui ;;
+            16) clear_screen; echo "Goodbye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -3265,6 +3372,14 @@ respawn|Respawn on death|persist|mp_respawn_on_death_t 1;mp_respawn_on_death_ct 
 warmup|Warmup period|persist|mp_do_warmup_period 1|mp_do_warmup_period 0
 cheats|Cheats (sv_cheats)|persist|sv_cheats 1|sv_cheats 0
 gotv|GOTV (tv_enable)|persist|tv_enable 1|tv_enable 0
+shop_open|Shop: whole shop (sv_buy_status_override)|persist|sv_buy_status_override 0|sv_buy_status_override 3
+shop_guns|Shop: buying guns (mp_buy_allow_guns)|persist|mp_buy_allow_guns 255|mp_buy_allow_guns 0
+shop_grenades|Shop: buying grenades (mp_buy_allow_grenades)|persist|mp_buy_allow_grenades 1|mp_buy_allow_grenades 0
+shop_pistols|Weapons allowed: pistols|persist|mp_weapons_allow_pistols -1|mp_weapons_allow_pistols 0
+shop_smgs|Weapons allowed: SMGs|persist|mp_weapons_allow_smgs -1|mp_weapons_allow_smgs 0
+shop_rifles|Weapons allowed: rifles|persist|mp_weapons_allow_rifles -1|mp_weapons_allow_rifles 0
+shop_heavy|Weapons allowed: heavy (shotguns, machine guns)|persist|mp_weapons_allow_heavy -1|mp_weapons_allow_heavy 0
+shop_zeus|Weapons allowed: Zeus|persist|mp_weapons_allow_zeus 1|mp_weapons_allow_zeus 0
 swap_teams|Swap teams|oneshot|mp_swapteams 1|mp_swapteams 0
 scramble_teams|Scramble teams|oneshot|mp_scrambleteams 1|mp_scrambleteams 0
 EOF
@@ -3797,9 +3912,9 @@ st_presets_ui() {   # <id>
 
 st_live_ui() {   # <id>  (running server only)
     local id=$1 c
-    local -a labels=("End warmup now" "Pause the match" "Resume the match" "Restart the game (all scores reset)" "Swap teams" "Scramble teams" "Re-apply the CS2Nexus settings (exec cs2nexus_settings.cfg)" "Reload server.cfg (exec server.cfg)")
-    local -a cmds=("mp_warmup_end" "mp_pause_match" "mp_unpause_match" "mp_restartgame 1" "mp_swapteams 1" "mp_scrambleteams 1" "exec cs2nexus_settings.cfg" "exec server.cfg")
-    local -a ask_first=(0 0 0 1 1 1 0 0)
+    local -a labels=("End warmup now" "Pause the match" "Resume the match" "Restart the game (all scores reset)" "Swap teams" "Scramble teams" "Re-apply the CS2Nexus settings (exec cs2nexus_settings.cfg)" "Reload server.cfg (exec server.cfg)" "SHOP: restore everything to the game defaults" "SHOP: check what the server really uses")
+    local -a cmds=("mp_warmup_end" "mp_pause_match" "mp_unpause_match" "mp_restartgame 1" "mp_swapteams 1" "mp_scrambleteams 1" "exec cs2nexus_settings.cfg" "exec server.cfg" "$SHOP_RESTORE_CMDS" "@shopcheck")
+    local -a ask_first=(0 0 0 1 1 1 0 0 1 0)
     local i
     if ! is_running "$id"; then warn "$S_NAME is offline. Start it first."; return; fi
     while :; do
@@ -3814,9 +3929,50 @@ st_live_ui() {   # <id>  (running server only)
         if ! [[ $c =~ ^[0-9]+$ ]] || ((10#$c < 1 || 10#$c > ${#cmds[@]})); then err "Invalid option."; sleep 1; continue; fi
         i=$((10#$c - 1))
         if ((ask_first[i])); then confirm_yn "${labels[i]} on $S_NAME now? [y/N]: " n || continue; fi
-        console_send "$id" "${cmds[i]}" && ok "Sent: ${cmds[i]}"
+        if [[ ${cmds[i]} == @shopcheck ]]; then st_shop_check "$id"; pause; continue; fi
+        if [[ ${cmds[i]} == *";"* ]]; then
+            local one
+            while IFS= read -r one; do [[ -n $one ]] && console_send "$id" "$one" >/dev/null; done < <(tr ';' '\n' <<<"${cmds[i]}")
+            ok "Sent the game-default shop values."
+            info "Note: the saved Quick options/Presets still apply after a map change. Set them to '--' (default) to stop that."
+        else
+            console_send "$id" "${cmds[i]}" && ok "Sent: ${cmds[i]}"
+        fi
         sleep 1
     done
+}
+
+# explicit game-default shop values (cvars keep their value even after a cfg line is removed, so they must be sent)
+SHOP_RESTORE_CMDS="sv_buy_status_override 0;mp_buytime 20;mp_buy_allow_guns 255;mp_buy_allow_grenades 1;mp_startmoney 800;mp_maxmoney 16000;mp_buy_anywhere 0;mp_weapons_allow_pistols -1;mp_weapons_allow_smgs -1;mp_weapons_allow_rifles -1;mp_weapons_allow_heavy -1;mp_weapons_allow_zeus 1"
+
+st_shop_check() {   # <id>: ask the running server about every shop-related cvar
+    local id=$1 k out line got def flag
+    local -a pairs=("sv_buy_status_override:0" "mp_buytime:20" "mp_buy_allow_guns:255" "mp_buy_allow_grenades:1" "mp_startmoney:800" "mp_maxmoney:16000" "mp_buy_anywhere:0" "mp_weapons_allow_pistols:-1" "mp_weapons_allow_smgs:-1" "mp_weapons_allow_rifles:-1" "mp_weapons_allow_heavy:-1" "mp_weapons_allow_zeus:1")
+    is_running "$id" || { warn "$S_NAME is offline. Start it first."; return; }
+    info "Asking $S_NAME about the shop settings..."
+    for k in "${pairs[@]}"; do console_send "$id" "${k%%:*}" >/dev/null; sleep 0.15; done
+    sleep 1
+    out=$(tmux_cs2 capture-pane -p -J -t "=$(session_name "$id"):" -S -1500 2>/dev/null)
+    echo; sep
+    for k in "${pairs[@]}"; do
+        def=${k##*:}; k=${k%%:*}
+        line=$(grep -E "(^|[^A-Za-z0-9_])${k}[\" ]*=" <<<"$out" | tail -n 1 | cut -c1-100)
+        got=$(sed -nE 's/.*=[[:space:]]*"?([^" ]+)"?.*/\1/p' <<<"$line" | head -n 1)
+        flag=""
+        if [[ -n $got ]]; then
+            case $k in
+                mp_buy_allow_guns) [[ $got == 0 ]] && flag="${RED}SHOP BLOCKED${RESET}" || flag="${GREEN}OK${RESET}" ;;
+                sv_buy_status_override) [[ $got == 0 ]] && flag="${GREEN}OK${RESET}" || flag="${RED}SHOP BLOCKED${RESET}" ;;
+                mp_buytime) awk -v a="$got" 'BEGIN{exit !(a+0 < 5)}' && flag="${RED}TOO SHORT${RESET}" || flag="${GREEN}OK${RESET}" ;;
+                mp_startmoney|mp_maxmoney) awk -v a="$got" 'BEGIN{exit !(a+0 == 0)}' && flag="${RED}ZERO${RESET}" || flag="${GREEN}OK${RESET}" ;;
+                *) if awk -v a="$got" -v b="$def" 'BEGIN{exit !(a+0 == b+0)}'; then flag="${GREEN}OK${RESET}"; else flag="${YELLOW}not default${RESET}"; fi ;;
+            esac
+        fi
+        printf '%-30s game default %-7s server says: %-20s %s\n' "$k" "$def" "${got:-(no answer found)}" "$flag"
+    done
+    sep
+    info "Red = the shop is blocked by this value. Fix: Live actions -> 'SHOP: restore everything to the game defaults'."
+    info "If it goes red again after a map change, a saved Quick option/Preset (e.g. 'no shop') or a plugin is resetting it."
 }
 
 st_check_ui() {   # <id>: ask the running server what it really uses
