@@ -1,0 +1,19 @@
+name: 💡 Feature request / پیشنهاد قابلیت
+description: Suggest an idea for CS2Nexus
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem do you want solved? / چه مشکلی را می‌خواهید حل کنید؟
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Your idea / ایدهٔ شما
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered / جایگزین‌هایی که بررسی کردید

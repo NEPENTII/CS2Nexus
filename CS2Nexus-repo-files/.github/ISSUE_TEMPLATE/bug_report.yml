@@ -1,0 +1,60 @@
+name: 🐛 Bug report / گزارش باگ
+description: Something is not working as expected
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please **remove tokens (GSLT, GITHUB_TOKEN) and private IPs** before pasting logs.
+        ممنون از گزارشتان! قبل از چسباندن لاگ، توکن‌ها و آی‌پی‌های خصوصی را پاک کنید.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened? / چه اتفاقی افتاد؟
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / مراحل بازتولید
+      placeholder: |
+        1. Open the menu
+        2. Choose ...
+        3. See error
+    validations:
+      required: true
+  - type: input
+    id: ubuntu
+    attributes:
+      label: Ubuntu version / نسخهٔ Ubuntu
+      placeholder: "22.04"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: CS2Nexus version or commit / نسخه یا کامیت
+      placeholder: "main @ abc1234"
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area / بخش
+      options:
+        - Server management
+        - Plugins
+        - Server settings
+        - Admins
+        - Resource monitor
+        - Watchdog / scheduled restart
+        - CS2 update (SteamCMD)
+        - Launcher self-update
+        - CLI / JSON output
+        - Other
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / لاگ
+      description: Output from Log Viewer or `<server>/logs/console.log`
+      render: shell

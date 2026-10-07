@@ -1,0 +1,26 @@
+name: Lint
+
+on:
+  push:
+    paths: ["launcher/**", ".github/workflows/lint.yml"]
+  pull_request:
+    paths: ["launcher/**", ".github/workflows/lint.yml"]
+
+jobs:
+  shell:
+    name: Syntax & ShellCheck
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: bash -n launcher/nexus.sh
+
+      - name: Launcher marker present (needed by self-update)
+        run: grep -q "CS2NEXUS-LAUNCHER" launcher/nexus.sh
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck -S error launcher/nexus.sh

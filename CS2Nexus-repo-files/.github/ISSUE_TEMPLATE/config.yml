@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Report a security vulnerability / گزارش آسیب‌پذیری امنیتی
+    url: https://github.com/NEPENTII/CS2Nexus/security/advisories/new
+    about: Please report security problems privately, not in a public issue.
