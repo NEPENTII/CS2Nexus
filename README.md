@@ -1,10 +1,9 @@
 <div align="center">
 
-![CS2NEXUS Logo](https://github.com/NEPENTII/CS2Nexus/blob/main/cs2nexus_logo.svg)
 <p align="center">
   <img src="https://github.com/NEPENTII/CS2Nexus/blob/main/cs2nexus_logo.svg" width="700" alt="CS2NEXUS Logo">
 </p>
-### The all-in-one Counter-Strike 2 server manager & launcher
+# The all-in-one Counter-Strike 2 server manager & launcher
 
 Create, run, configure and maintain multiple CS2 dedicated servers from a single menu — with shared plugins, one-click setup, auto-updates and a watchdog.
 
