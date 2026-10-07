@@ -1,6 +1,6 @@
 <div align="center">
 
-**🌐 Language:** &nbsp; 🇬🇧 **English** &nbsp;|&nbsp; [🇮🇷 فارسی](README.fa.md)
+**🌐 زبان:** &nbsp; [🇬🇧 English](README.md) &nbsp;|&nbsp; 🇮🇷 **فارسی**
 
 <img src="https://raw.githubusercontent.com/NEPENTII/CS2Nexus/main/cs2nexus_logo.svg" width="720" alt="CS2NEXUS Logo">
 
@@ -8,9 +8,9 @@
 
 # ⚡ CS2NEXUS
 
-### The all-in-one Counter-Strike 2 server manager & launcher
+### مدیر و لانچر همه‌کاره برای سرورهای Counter-Strike 2
 
-*Create, run, configure and maintain multiple CS2 dedicated servers from a single menu —<br>shared plugins, one-click setup, auto-updates and a watchdog that never sleeps.*
+*چندین سرور اختصاصی CS2 را از یک منو بسازید، اجرا کنید، تنظیم کنید و نگه‌داری کنید —<br>با پلاگین‌های مشترک، نصب تک‌کلیکی، آپدیت خودکار و واچ‌داگی که هیچ‌وقت نمی‌خوابد.*
 
 <br>
 
@@ -27,61 +27,36 @@
 
 <br>
 
-**[🚀 Quick Start](#-quick-start)** &nbsp;·&nbsp;
-**[✨ Features](#-features)** &nbsp;·&nbsp;
-**[🧭 Menu](#-the-menu)** &nbsp;·&nbsp;
-**[💻 CLI](#-command-line-usage)** &nbsp;·&nbsp;
-**[🔌 Plugins](#-shared-plugins)** &nbsp;·&nbsp;
-**[❓ FAQ](#-faq)**
+**[🚀 شروع سریع](#-شروع-سریع)** &nbsp;·&nbsp;
+**[✨ امکانات](#-امکانات)** &nbsp;·&nbsp;
+**[🧭 منو](#-منو)** &nbsp;·&nbsp;
+**[💻 خط فرمان](#-استفاده-از-خط-فرمان)** &nbsp;·&nbsp;
+**[🔌 پلاگین‌ها](#-پلاگین‌های-مشترک)** &nbsp;·&nbsp;
+**[❓ سؤالات متداول](#-سؤالات-متداول)**
 
 </div>
 
----
-
-## 📖 Table of Contents
-
-<details>
-<summary><b>Click to expand</b></summary>
-
-- [Why CS2Nexus?](#-why-cs2nexus)
-- [How it works](#-how-it-works)
-- [Features](#-features)
-- [Requirements](#-requirements)
-- [Quick Start](#-quick-start)
-- [The Menu](#-the-menu)
-- [Command-Line Usage](#-command-line-usage)
-- [Shared Plugins](#-shared-plugins)
-- [Server Settings](#-server-settings)
-- [Maintenance](#-maintenance)
-- [Directory Layout](#-directory-layout)
-- [Configuration](#-configuration)
-- [Safety Design](#-safety-design)
-- [Troubleshooting](#-troubleshooting)
-- [FAQ](#-faq)
-- [Contributing](#-contributing)
-- [Credits](#-credits)
-
-</details>
+<div dir="rtl">
 
 ---
 
-## 🚀 Why CS2Nexus?
+## 🚀 چرا CS2Nexus؟
 
-Running several CS2 servers normally means:
+اجرای چند سرور CS2 معمولاً یعنی:
 
-| ❌ The old way | ✅ With CS2Nexus |
+| ❌ روش قدیمی | ✅ با CS2Nexus |
 |---|---|
-| Copying **60+ GB** of game files for every server | **One** base install, shared through symlinks — a new server costs a few MB |
-| Juggling `tmux` sessions by hand | Start / stop / attach from one menu |
-| Updating plugins server by server | **One copy** of each plugin, linked into every server |
-| Editing `server.cfg` and hoping game-mode configs don't override it | A managed config block **plus** override files that always win |
-| Finding out a server crashed from angry players | A **watchdog** restarts it for you |
+| کپی‌کردن **بیش از ۶۰ گیگابایت** فایل بازی برای هر سرور | **یک** نصب پایه که با symlink بین همه به اشتراک گذاشته می‌شود؛ هر سرور جدید فقط چند مگابایت |
+| مدیریت دستی نشست‌های `tmux` | شروع / توقف / اتصال از یک منو |
+| آپدیت پلاگین‌ها سرور به سرور | **یک نسخه** از هر پلاگین، لینک‌شده به همهٔ سرورها |
+| ویرایش `server.cfg` به امید اینکه کانفیگ مود بازی آن را بازنویسی نکند | یک بلاک مدیریت‌شده **به‌همراه** فایل‌های override که همیشه برنده‌اند |
+| فهمیدن کرش سرور از بازیکنان عصبانی | یک **واچ‌داگ** که خودش سرور را ری‌استارت می‌کند |
 
-**One launcher. Every server. Zero babysitting.**
+**یک لانچر. همهٔ سرورها. بدون دردسر.**
 
 ---
 
-## 🧩 How it works
+## 🧩 نحوهٔ کار
 
 ```mermaid
 flowchart LR
@@ -106,66 +81,80 @@ flowchart LR
 
 ---
 
-## ✨ Features
+## ✨ امکانات
 
-### 🖥️ Server Management
-- Create, start, stop, restart and delete servers from a menu
-- Many servers on one machine — each with its own **port, name, map and client limit**
-- **Workshop map support** — enter a map name, a Workshop ID, or a Steam Workshop link
-- Per-server **GSLT token** support (`sv_setsteamaccount`)
-- Live **player list** and **join/leave history** from game logs
-- Runs inside `tmux`, so servers survive closing your SSH session
+### 🖥️ مدیریت سرور
+- ساخت، شروع، توقف، ری‌استارت و حذف سرور از طریق منو
+- چند سرور روی یک ماشین — هرکدام با **پورت، نام، مپ و حداکثر کلاینت** مخصوص خود
+- **پشتیبانی از مپ‌های Workshop** — نام مپ، شناسهٔ Workshop یا لینک Steam Workshop را وارد کنید
+- پشتیبانی از **توکن GSLT** برای هر سرور (`sv_setsteamaccount`)
+- **لیست بازیکنان** زنده و **تاریخچهٔ ورود/خروج** از روی لاگ‌های بازی
+- اجرا داخل `tmux`؛ با بستن SSH سرورها زنده می‌مانند
 
-### 💾 Smart Disk Usage
-- One base CS2 install (`/opt/cs2`) shared by every server via symlinks
-- Each server keeps its own real `cfg`, `addons`, `logs` and launcher files
-- Base files are **never modified** by the manager
+### 💾 مصرف هوشمند دیسک
+- یک نصب پایهٔ CS2 (`/opt/cs2`) که با symlink بین همهٔ سرورها مشترک است
+- هر سرور `cfg`، `addons`، `logs` و فایل‌های لانچر واقعیِ خودش را دارد
+- فایل‌های پایه **هرگز** توسط مدیر تغییر نمی‌کنند
 
-### 🔌 Shared Plugin System
-- One copy of each plugin, linked into every server
-- **Drop-folder auto-discovery** — put a plugin in the shared folder and it is registered automatically
-- Per-server data modes: **independent**, **shared**, or **custom per-file**
-- Install a plugin on all servers, only selected ones, or all except some
-- Built-in **Plugin Browser** that reads plugins straight from GitHub
-- **Auto-update** timer with automatic backups of old versions
+### 🔌 سیستم پلاگین مشترک
+- یک نسخه از هر پلاگین، لینک‌شده به همهٔ سرورها
+- **کشف خودکار با Drop-folder** — پلاگین را در پوشهٔ مشترک بگذارید تا خودکار ثبت شود
+- حالت‌های داده برای هر سرور: **مستقل**، **مشترک** یا **سفارشی (به‌ازای هر فایل)**
+- نصب پلاگین روی همهٔ سرورها، فقط سرورهای انتخابی، یا همه به‌جز بعضی
+- **مرورگر پلاگین** داخلی که مستقیم از GitHub می‌خواند
+- تایمر **آپدیت خودکار** با بکاپ خودکار نسخه‌های قدیمی
 
-### ⚙️ Server Settings Engine
-- **150+ documented cvars** grouped by category (rounds, economy, voice, votes, bots, GOTV, movement and more)
-- **Quick options:** bunny hop, infinite ammo, friendly fire, all-talk, respawn, buy anywhere…
-- **Presets:** free server, no votes, no shop, no drops, headshot only and others
-- Game mode selector, round time and warmup control
-- Default settings inherited by every new server
-- Config is written into a managed block of `server.cfg`, plus game-mode override files so game-mode configs can't silently override your values
-- **Live actions:** end warmup, pause, restart game, swap teams, scramble teams
-- **Verify** what the running server actually uses
+### ⚙️ موتور تنظیمات سرور
+- **بیش از ۱۵۰ cvar مستندشده** در دسته‌بندی‌های مختلف (راند، اقتصاد، ویس، رأی‌گیری، بات، GOTV، حرکت و ...)
+- **گزینه‌های سریع:** bunny hop، مهمات بی‌نهایت، friendly fire، all-talk، respawn، خرید از همه‌جا و ...
+- **پریست‌ها:** سرور رایگان، بدون رأی‌گیری، بدون فروشگاه، بدون دراپ، فقط هدشات و ...
+- انتخاب مود بازی، زمان راند و کنترل warmup
+- تنظیمات پیش‌فرضی که هر سرور جدید به ارث می‌برد
+- کانفیگ داخل یک بلاک مدیریت‌شده در `server.cfg` نوشته می‌شود، به‌علاوهٔ فایل‌های override برای مودهای بازی تا کانفیگ مودها بی‌صدا مقادیر شما را بازنویسی نکنند
+- **اکشن‌های زنده:** پایان warmup، pause، ری‌استارت بازی، جابه‌جایی و بُر زدن تیم‌ها
+- **بررسی** اینکه سرور در حال اجرا واقعاً از چه مقادیری استفاده می‌کند
 
-### 🛡️ Reliability
-- **Watchdog** — restarts crashed servers (with restart-rate limiting) and never restarts servers you stopped on purpose
-- **Scheduled restarts** with automatic 5-minute and 1-minute warnings to players
-- **CS2 updates through SteamCMD** with countdown, safe stop, update and restart
-- **Launcher self-update** from GitHub with syntax and marker validation and automatic backups
-- Atomic JSON writes with rotating backups
+### 🛡️ پایداری
+- **واچ‌داگ** — سرورهای کرش‌کرده را (با محدودیت نرخ ری‌استارت) ری‌استارت می‌کند و سروری را که عمداً متوقف کرده‌اید هرگز دوباره روشن نمی‌کند
+- **ری‌استارت زمان‌بندی‌شده** با هشدار خودکار ۵ دقیقه و ۱ دقیقه قبل به بازیکنان
+- **آپدیت CS2 از طریق SteamCMD** با شمارش معکوس، توقف امن، آپدیت و ری‌استارت
+- **آپدیت خودکار لانچر** از GitHub با اعتبارسنجی سینتکس و مارکر و بکاپ خودکار
+- نوشتن اتمیک فایل‌های JSON با بکاپ چرخشی
 
-### 🧰 Automation
-- Full non-interactive CLI for **cron, systemd or a web panel**
-- `--json` output for list and status commands
+### 👑 مدیریت ادمین‌ها
+- یک صفحهٔ **Admins** برای همهٔ سرورها — دیگر لازم نیست `admins.json` را دستی ویرایش کنید
+- تبدیل یک ادمین به **ادمین پیش‌فرض**: روی همهٔ سرورها نوشته می‌شود، حتی سرورهایی که بعداً ساخته می‌شوند
+- یا محدودکردن ادمین به **سرورهای انتخابی**
+- **انتخاب دسترسی‌ها** برای هر ادمین، به‌همراه سطح immunity و تگ چت
+- فایل‌های کانفیگ ادمین CounterStrikeSharp را مستقیم و با اعتبارسنجی می‌نویسد
+
+### 📊 مانیتور زندهٔ منابع
+- نمایش لحظه‌ای **CPU، RAM و دیسک** درون خود منو
+- نمای خودکار-به‌روزشونده — برای بازگشت `q` یا `Enter` بزنید
+- قبل از اینکه بازیکنان متوجه شوند، سنگین‌شدن ماشین را ببینید
+
+### 🧰 اتوماسیون
+- خط فرمان کامل و غیرتعاملی برای **cron، systemd یا پنل وب**
+- خروجی `--json` برای دستورهای list و status
 
 ---
 
-## 📋 Requirements
+## 📋 پیش‌نیازها
 
-| | Requirement |
+| | نیازمندی |
 |---|---|
-| 🐧 **OS** | Ubuntu 22.04 (other Debian-based systems may work) |
-| 🔑 **Privileges** | `root` (or `sudo`) |
-| 💽 **Disk** | ~65 GB free for the CS2 base installation |
-| 🌐 **Network** | Internet access for SteamCMD and GitHub |
+| 🐧 **سیستم‌عامل** | Ubuntu 22.04 (سیستم‌های مبتنی بر Debian هم ممکن است کار کنند) |
+| 🔑 **دسترسی** | `root` (یا `sudo`) |
+| 💽 **دیسک** | حدود ۶۵ گیگابایت فضای خالی برای نصب پایهٔ CS2 |
+| 🌐 **شبکه** | دسترسی اینترنت برای SteamCMD و GitHub |
 
-The launcher checks its own dependencies (`jq`, `tmux`, `curl`, `unzip`, `tar` and others) and offers to install anything missing.
+لانچر وابستگی‌های خودش (`jq`، `tmux`، `curl`، `unzip`، `tar` و غیره) را بررسی می‌کند و هر چیزی که نصب نباشد را پیشنهاد نصب می‌دهد.
 
 ---
 
-## ⚡ Quick Start
+## ⚡ شروع سریع
+
+</div>
 
 ```bash
 # 1. Download the launcher
@@ -182,20 +171,24 @@ sudo /opt/nexus.sh --install
 sudo nexus
 ```
 
-On the first run, a **setup wizard** will:
+<div dir="rtl">
 
-1. 👤 Create the `cs2` system user
-2. 📥 Find your existing CS2 server files, or install SteamCMD and download them
-3. 🎮 Create your first server with default settings
-4. 🧱 Optionally install **Metamod:Source** and **CounterStrikeSharp**
-5. 🔌 Optionally install the default plugins (**ServerCommands, MapVote, Parachute, AstraSkins**)
-6. 🐕 Optionally enable the **watchdog** for automatic restarts
+در اولین اجرا، یک **ویزارد راه‌اندازی** این کارها را انجام می‌دهد:
 
-> 💡 **Tip:** The first CS2 download is large (60+ GB). The wizard retries SteamCMD automatically if the first attempt fails.
+1. 👤 ساخت کاربر سیستمی `cs2`
+2. 📥 پیدا کردن فایل‌های موجود سرور CS2 یا نصب SteamCMD و دانلود آن‌ها
+3. 🎮 ساخت اولین سرور با تنظیمات پیش‌فرض
+4. 🧱 نصب اختیاری **Metamod:Source** و **CounterStrikeSharp**
+5. 🔌 نصب اختیاری پلاگین‌های پیش‌فرض (**ServerCommands, MapVote, Parachute, AstraSkins**)
+6. 🐕 فعال‌سازی اختیاری **واچ‌داگ** برای ری‌استارت خودکار
+
+> 💡 **نکته:** دانلود اولیهٔ CS2 حجیم است (بیش از ۶۰ گیگابایت). اگر تلاش اول شکست بخورد، ویزارد SteamCMD را خودکار دوباره اجرا می‌کند.
 
 ---
 
-## 🧭 The Menu
+## 🧭 منو
+
+</div>
 
 ```text
 ╔══════════════════════════════════╗
@@ -203,26 +196,33 @@ On the first run, a **setup wizard** will:
 ║     Server Manager & Launcher    ║
 ╚══════════════════════════════════╝
 
-  1) Create Server          8) Players & History
-  2) Start Server           9) Plugins
-  3) Stop Server           10) Server Settings
-  4) Restart Server        11) Server Console
-  5) List Servers          12) Log Viewer
-  6) Server Status         13) Maintenance
-  7) Delete Server         14) Exit
+  1) Create Server          9) Plugins
+  2) Start Server          10) Server Settings
+  3) Stop Server           11) Server Console
+  4) Restart Server        12) Log Viewer
+  5) List Servers          13) Maintenance
+  6) Server Status         14) Admins
+  7) Delete Server         15) Resource Monitor (live)
+  8) Players & History     16) Exit
 ```
 
-| Section | What it does |
-|---|---|
-| 🖲️ **Console** | Attach (full or read-only), send one command, or broadcast to all running servers |
-| 📜 **Log Viewer** | View or follow game logs and console output (control characters are stripped) |
-| 🧰 **Maintenance** | CS2 update, scheduled restarts, watchdog, JSON backups, launcher update, launcher settings |
+<div dir="rtl">
 
-> 🚪 To leave an attached console **without** stopping the server, press **`Ctrl+B`, then `D`**.
+| بخش | کارکرد |
+|---|---|
+| 🖲️ **کنسول** | اتصال (کامل یا فقط‌خواندنی)، ارسال یک دستور، یا پخش پیام به همهٔ سرورهای در حال اجرا |
+| 📜 **نمایشگر لاگ** | مشاهده یا دنبال‌کردن زندهٔ لاگ بازی و خروجی کنسول (کاراکترهای کنترلی حذف می‌شوند) |
+| 🧰 **نگه‌داری** | آپدیت CS2، ری‌استارت زمان‌بندی‌شده، واچ‌داگ، بکاپ JSON، آپدیت لانچر، تنظیمات لانچر |
+| 👑 **ادمین‌ها** | دیدن همهٔ ادمین‌ها در تمام سرورها، تبدیل به ادمین پیش‌فرض، محدودکردن به سرورهای انتخابی، ویرایش دسترسی‌ها، immunity و تگ |
+| 📊 **مانیتور منابع** | نمایش زندهٔ مصرف CPU / RAM / دیسک — برای بازگشت `q` یا `Enter` بزنید |
+
+> 🚪 برای خروج از کنسول متصل‌شده **بدون** متوقف‌کردن سرور، **`Ctrl+B`** و سپس **`D`** را بزنید.
 
 ---
 
-## 💻 Command-Line Usage
+## 💻 استفاده از خط فرمان
+
+</div>
 
 ```bash
 nexus list [--json]           # list servers and their state
@@ -238,34 +238,46 @@ nexus plugin-update           # update plugins from the Plugin Browser (used by 
 nexus help                    # show help
 ```
 
-> The short alias `cs2` works exactly the same as `nexus`.
+<div dir="rtl">
 
-| Exit code | Meaning |
+> نام کوتاه `cs2` دقیقاً مثل `nexus` کار می‌کند.
+
+| کد خروج | معنی |
 |:---:|---|
-| `0` | ✅ OK |
-| `1` | ⚠️ Error or skipped items |
-| `2` | ❌ Usage error |
+| `0` | ✅ موفق |
+| `1` | ⚠️ خطا یا مواردی که رد شدند |
+| `2` | ❌ خطای استفاده |
 
-With `--json`, **only JSON** goes to `stdout`; every human-readable message goes to `stderr`, so it pipes cleanly:
+با `--json` **فقط JSON** روی `stdout` چاپ می‌شود و همهٔ پیام‌های قابل‌خواندن برای انسان به `stderr` می‌روند، پس به‌راحتی پایپ می‌شود:
+
+</div>
 
 ```bash
 nexus status --json | jq '.[] | {name, port, status, players}'
 ```
 
+<div dir="rtl">
+
 <details>
-<summary>⏰ <b>Cron example — announce a restart every night</b></summary>
+<summary>⏰ <b>نمونهٔ cron — اعلام ری‌استارت هر شب</b></summary>
+
+</div>
 
 ```cron
 55 3 * * * /usr/local/bin/nexus broadcast "Server restarts in 5 minutes!"
 ```
 
+<div dir="rtl">
+
 </details>
 
 ---
 
-## 🔌 Shared Plugins
+## 🔌 پلاگین‌های مشترک
 
-Plugins live **once** in:
+پلاگین‌ها **فقط یک‌بار** در این مسیر قرار می‌گیرند:
+
+</div>
 
 ```text
 /opt/cs2-servers/shared/addons/
@@ -273,60 +285,64 @@ Plugins live **once** in:
 └── metamod/plugins/<PluginName>
 ```
 
-Anything you place in these folders is **registered automatically** and linked into every server on the next sync or server start.
+<div dir="rtl">
 
-### 🗂️ Data modes
+هر چیزی که در این پوشه‌ها بگذارید **خودکار ثبت می‌شود** و در sync یا استارت بعدی سرور به همهٔ سرورها لینک می‌شود.
 
-| Mode | Behaviour |
+### 🗂️ حالت‌های داده
+
+| حالت | رفتار |
 |---|---|
-| 🔹 **Independent** | Each server keeps its own `data` folder |
-| 🔸 **Shared** | All servers use the same data from the central copy |
-| 🔶 **Custom** | You choose exactly which files or folders stay per-server (e.g. `data/astra_skins.sqlite`) |
+| 🔹 **مستقل** | هر سرور پوشهٔ `data` مخصوص خودش را دارد |
+| 🔸 **مشترک** | همهٔ سرورها از همان داده‌های نسخهٔ مرکزی استفاده می‌کنند |
+| 🔶 **سفارشی** | دقیقاً انتخاب می‌کنید کدام فایل‌ها یا پوشه‌ها برای هر سرور جدا بمانند (مثلاً `data/astra_skins.sqlite`) |
 
-### 🎯 Assignment
+### 🎯 تخصیص
 
-- ✅ All servers (default — including servers created later)
-- 🎯 Selected servers only
-- 🚫 All servers **except** some
+- ✅ همهٔ سرورها (پیش‌فرض — شامل سرورهایی که بعداً ساخته می‌شوند)
+- 🎯 فقط سرورهای انتخابی
+- 🚫 همهٔ سرورها **به‌جز** بعضی
 
-### 🛒 Plugin Browser & Auto-Update
+### 🛒 مرورگر پلاگین و آپدیت خودکار
 
-The built-in browser lists plugins from the `plugins` folder of the CS2Nexus GitHub repository, plus any extra GitHub release sources you add. Enable the **auto-update** timer (every 30 minutes) to keep them current. Old versions are backed up automatically — the last 5 are kept.
+مرورگر داخلی، پلاگین‌ها را از پوشهٔ `plugins` در مخزن GitHub پروژهٔ CS2Nexus فهرست می‌کند، به‌علاوهٔ هر منبع release گیت‌هابی که خودتان اضافه کنید. تایمر **آپدیت خودکار** (هر ۳۰ دقیقه) را فعال کنید تا همه به‌روز بمانند. نسخه‌های قدیمی خودکار بکاپ می‌شوند و ۵ تای آخر نگه داشته می‌شوند.
 
-> ⚠️ Only single plugins can be shared (`<prefix>/<PLUGIN>`). Core files of Metamod or CounterStrikeSharp are **never** shared.
+> ⚠️ فقط پلاگین‌های تکی قابل اشتراک‌اند (`<prefix>/<PLUGIN>`). فایل‌های هستهٔ Metamod یا CounterStrikeSharp **هرگز** به اشتراک گذاشته نمی‌شوند.
 
 ---
 
-## 🎛️ Server Settings
+## 🎛️ تنظیمات سرور
 
-Open **Server Settings** from the main menu. Choose `0` for the **DEFAULT** profile that new servers inherit, or pick a specific server.
+از منوی اصلی **Server Settings** را باز کنید. عدد `0` پروفایل **DEFAULT** است که سرورهای جدید از آن ارث می‌برند؛ یا یک سرور مشخص را انتخاب کنید.
 
-| Area | Examples |
+| بخش | نمونه‌ها |
 |---|---|
-| 🏷️ **Basics** | Name, port, client limit, start map, GSLT |
-| 🎮 **Game mode** | Casual, Competitive, Wingman, Arms Race, Demolition, Deathmatch |
-| ⚡ **Quick options** | Bunny hop, infinite ammo/money, friendly fire, all-talk, respawn, GOTV, cheats |
-| 🎁 **Presets** | Free server, no votes, no timeouts, no shop, no drops, headshot only |
-| 📚 **CFG settings** | Every cvar by category, with descriptions and validation |
-| ✍️ **Custom lines** | Any extra console command |
-| 🔴 **Live actions** | End warmup, pause/resume, restart game, swap/scramble teams |
-| 🔍 **Check** | Ask the running server what values it really uses |
+| 🏷️ **مبانی** | نام، پورت، حداکثر کلاینت، مپ شروع، GSLT |
+| 🎮 **مود بازی** | Casual، Competitive، Wingman، Arms Race، Demolition، Deathmatch |
+| ⚡ **گزینه‌های سریع** | bunny hop، مهمات/پول بی‌نهایت، friendly fire، all-talk، respawn، GOTV، چیت |
+| 🎁 **پریست‌ها** | سرور رایگان، بدون رأی‌گیری، بدون timeout، بدون فروشگاه، بدون دراپ، فقط هدشات |
+| 📚 **تنظیمات CFG** | همهٔ cvarها به‌تفکیک دسته، با توضیح و اعتبارسنجی |
+| ✍️ **خطوط سفارشی** | هر دستور کنسول دلخواه |
+| 🔴 **اکشن‌های زنده** | پایان warmup، pause/resume، ری‌استارت بازی، جابه‌جایی/بُر زدن تیم‌ها |
+| 🔍 **بررسی** | از سرور در حال اجرا بپرسید واقعاً از چه مقادیری استفاده می‌کند |
 
 ---
 
-## 🛠️ Maintenance
+## 🛠️ نگه‌داری
 
-| Task | What happens |
+| کار | چه اتفاقی می‌افتد |
 |---|---|
-| 🔄 **Update CS2** | Warns players with a countdown → stops running servers → runs SteamCMD → re-patches `gameinfo.gi` for Metamod → starts the servers again |
-| ⏱️ **Scheduled restart** | Pick `HH:MM` or `+N` minutes; players get warnings 5 and 1 minute before |
-| 🐕 **Watchdog / autostart** | A systemd timer checks every minute; limited to **3 restarts per 10 minutes** per server |
-| 💾 **JSON backups** | Rotating backups of every registry file (newest 10 kept) |
-| 🚀 **Update launcher** | Downloads, validates (shebang, marker, size, `bash -n`), backs up and swaps the launcher, then restarts the servers that were running |
+| 🔄 **آپدیت CS2** | با شمارش معکوس به بازیکنان هشدار می‌دهد ← سرورهای در حال اجرا را متوقف می‌کند ← SteamCMD را اجرا می‌کند ← `gameinfo.gi` را برای Metamod دوباره پچ می‌کند ← سرورها را دوباره روشن می‌کند |
+| ⏱️ **ری‌استارت زمان‌بندی‌شده** | `HH:MM` یا `+N` دقیقه را انتخاب کنید؛ بازیکنان ۵ و ۱ دقیقه قبل هشدار می‌گیرند |
+| 🐕 **واچ‌داگ / autostart** | یک تایمر systemd هر دقیقه بررسی می‌کند؛ حداکثر **۳ ری‌استارت در هر ۱۰ دقیقه** برای هر سرور |
+| 💾 **بکاپ JSON** | بکاپ چرخشی از همهٔ فایل‌های رجیستری (۱۰ تای آخر نگه داشته می‌شوند) |
+| 🚀 **آپدیت لانچر** | دانلود، اعتبارسنجی (shebang، مارکر، اندازه، `bash -n`)، بکاپ و جایگزینی لانچر، سپس ری‌استارت سرورهایی که روشن بودند |
 
 ---
 
-## 📁 Directory Layout
+## 📁 ساختار پوشه‌ها
+
+</div>
 
 ```text
 /opt/cs2/                         # Base CS2 install (never modified by servers)
@@ -343,110 +359,114 @@ Open **Server Settings** from the main menu. Choose `0` for the **DEFAULT** prof
 /etc/cs2nexus.conf                # Launcher configuration
 ```
 
+<div dir="rtl">
+
 ---
 
-## ⚙️ Configuration
+## ⚙️ پیکربندی
 
-`/etc/cs2nexus.conf` holds plain `KEY=VALUE` lines. It is **parsed, never sourced**, and every value is validated.
+فایل `/etc/cs2nexus.conf` شامل خطوط ساده‌ی `KEY=VALUE` است. این فایل **پارس می‌شود، هرگز source نمی‌شود** و تک‌تک مقادیر اعتبارسنجی می‌شوند.
 
-| Key | Description |
+| کلید | توضیح |
 |---|---|
-| `BASE` | Path of the CS2 base installation |
-| `NEXUS_REPO` / `NEXUS_BRANCH` | GitHub repository and branch used for plugins and launcher updates |
-| `EXTRA_PLUGIN_REPOS` | Extra `owner/repo` release sources, comma separated |
-| `GITHUB_TOKEN` | Optional token for private repos or rate limits |
-| `AUTOUPDATE` | `1` to enable plugin auto-update |
-| `UPDATE_ACTION` | `none` or `reload` — what to do on running servers after a plugin update |
+| `BASE` | مسیر نصب پایهٔ CS2 |
+| `NEXUS_REPO` / `NEXUS_BRANCH` | مخزن و شاخهٔ GitHub برای پلاگین‌ها و آپدیت لانچر |
+| `EXTRA_PLUGIN_REPOS` | منابع release اضافه به‌شکل `owner/repo`، جداشده با کاما |
+| `GITHUB_TOKEN` | توکن اختیاری برای مخزن‌های خصوصی یا محدودیت نرخ |
+| `AUTOUPDATE` | مقدار `1` آپدیت خودکار پلاگین را فعال می‌کند |
+| `UPDATE_ACTION` | `none` یا `reload` — بعد از آپدیت پلاگین روی سرورهای در حال اجرا چه شود |
 
-Most of these can be changed from **Maintenance → Launcher settings**.
-
----
-
-## 🔒 Safety Design
-
-CS2Nexus is built so it can't damage your data:
-
-- 🧱 Strict path validation before any destructive operation (`rm -rf` only with safety checks and `--one-file-system`)
-- 🔗 Real local plugin files and foreign symlinks are **never overwritten**
-- 📝 Every JSON write is validated, backed up, written to a temp file, then moved atomically
-- 🔐 A re-entrant operations lock stops the menu, cron and timers from colliding
-- 🚫 Lock file descriptors are closed for `tmux`, so they never leak into game servers
-- 📦 Downloaded plugin packages are rejected if they contain symlinks or exceed the size limit
-- 🙋 Servers are only touched when you ask — a manual stop is respected by the watchdog
-
-> ⚠️ **Heads-up:** the launcher runs as **root** and its self-update downloads a script from GitHub. Only point it at a repository **you control**.
+بیشتر این موارد از **Maintenance ← Launcher settings** قابل تغییرند.
 
 ---
 
-## 🩺 Troubleshooting
+## 🔒 طراحی ایمن
+
+CS2Nexus طوری ساخته شده که به داده‌های شما آسیب نزند:
+
+- 🧱 اعتبارسنجی سخت‌گیرانهٔ مسیرها قبل از هر عملیات مخرب (`rm -rf` فقط با بررسی‌های ایمنی و `--one-file-system`)
+- 🔗 فایل‌های واقعی پلاگین و symlinkهای بیگانه **هرگز بازنویسی نمی‌شوند**
+- 📝 هر نوشتن JSON اعتبارسنجی، بکاپ و در فایل موقت نوشته و سپس به‌صورت اتمیک جابه‌جا می‌شود
+- 🔐 یک قفل re-entrant مانع برخورد منو، cron و تایمرها می‌شود
+- 🚫 File descriptorهای قفل برای `tmux` بسته می‌شوند تا هرگز به سرورهای بازی نشت نکنند
+- 📦 بسته‌های پلاگین دانلودشده در صورت داشتن symlink یا عبور از حد حجم رد می‌شوند
+- 🙋 به سرورها فقط وقتی دست می‌زند که شما بخواهید — توقف دستی توسط واچ‌داگ رعایت می‌شود
+
+> ⚠️ **توجه:** لانچر با دسترسی **root** اجرا می‌شود و آپدیت خودکارش یک اسکریپت را از GitHub دانلود می‌کند. آن را فقط به مخزنی وصل کنید که **خودتان کنترل می‌کنید**.
+
+---
+
+## 🩺 عیب‌یابی
 
 <details>
-<summary><b>SteamCMD download fails or stalls</b></summary>
+<summary><b>دانلود SteamCMD شکست می‌خورد یا گیر می‌کند</b></summary>
 
-The wizard retries automatically. If it keeps failing, check free disk space (~65 GB) and your connection to Steam, then run **Maintenance → Update CS2** again.
+ویزارد خودکار دوباره تلاش می‌کند. اگر ادامه داشت، فضای خالی دیسک (حدود ۶۵ گیگابایت) و اتصالتان به Steam را بررسی کنید و دوباره **Maintenance ← Update CS2** را اجرا کنید.
 
 </details>
 
 <details>
-<summary><b>A server won't start</b></summary>
+<summary><b>سرور استارت نمی‌شود</b></summary>
 
-Open **Log Viewer** and check `<server>/logs/console.log`. The most common causes are a port already in use or a missing/invalid GSLT token.
-
-</details>
-
-<details>
-<summary><b>Plugin not loading after a CS2 update</b></summary>
-
-Metamod and CounterStrikeSharp are not touched by CS2 updates. Make sure their versions match the new game build.
+**Log Viewer** را باز کنید و `<server>/logs/console.log` را ببینید. شایع‌ترین علت‌ها: پورت در حال استفاده یا نبودِ توکن GSLT / نامعتبر بودن آن.
 
 </details>
 
 <details>
-<summary><b>Dropped plugin doesn't appear</b></summary>
+<summary><b>پلاگین بعد از آپدیت CS2 لود نمی‌شود</b></summary>
 
-Run `nexus sync` (or `nexus sync --dry-run` first to preview what will change).
+آپدیت CS2 به Metamod و CounterStrikeSharp دست نمی‌زند. مطمئن شوید نسخهٔ آن‌ها با بیلد جدید بازی سازگار است.
+
+</details>
+
+<details>
+<summary><b>پلاگینی که گذاشتم نمایش داده نمی‌شود</b></summary>
+
+دستور `nexus sync` را اجرا کنید (برای پیش‌نمایش تغییرات، ابتدا `nexus sync --dry-run`).
 
 </details>
 
 ---
 
-## ❓ FAQ
+## ❓ سؤالات متداول
 
-**Does each server need its own GSLT token?**
-Yes. Create one per server at <https://steamcommunity.com/dev/managegameservers> with App ID `730`.
+**آیا هر سرور توکن GSLT جدا می‌خواهد؟**
+بله. برای هر سرور یکی در <https://steamcommunity.com/dev/managegameservers> با App ID برابر `730` بسازید.
 
-**Where are my game logs?**
-In each server's `game/csgo/logs` folder; console output is in `<server>/logs/console.log`.
+**لاگ‌های بازی کجاست؟**
+در پوشهٔ `game/csgo/logs` هر سرور؛ خروجی کنسول در `<server>/logs/console.log` است.
 
-**How do I attach to a server console?**
-Use **Server Console → Attach**, or run `runuser -u cs2 -- tmux attach -t cs2-<ID>`. Detach with **Ctrl+B, then D**.
+**چطور به کنسول سرور وصل شوم؟**
+از **Server Console ← Attach** استفاده کنید یا `runuser -u cs2 -- tmux attach -t cs2-<ID>` را اجرا کنید. برای خروج **Ctrl+B و سپس D**.
 
-**A plugin stopped working after a CS2 update.**
-Metamod and CounterStrikeSharp are not touched by the CS2 update. Check that their versions match the new game build.
+**بعد از آپدیت CS2 یک پلاگین کار نمی‌کند.**
+آپدیت CS2 به Metamod و CounterStrikeSharp دست نمی‌زند. بررسی کنید نسخه‌هایشان با بیلد جدید بازی هماهنگ باشد.
 
-**Can I add my own plugins?**
-Yes. Copy the plugin folder into `shared/addons/counterstrikesharp/plugins/` (or the `metamod/plugins/` equivalent) and run `nexus sync`.
-
----
-
-## 🤝 Contributing
-
-Issues and pull requests are welcome! If you find a bug or have an idea, open an issue and describe your setup (Ubuntu version, CS2 build and the steps to reproduce).
+**می‌توانم پلاگین خودم را اضافه کنم؟**
+بله. پوشهٔ پلاگین را در `shared/addons/counterstrikesharp/plugins/` (یا معادل `metamod/plugins/`) کپی کنید و `nexus sync` را اجرا کنید.
 
 ---
 
-## 👤 Credits
+## 🤝 مشارکت
+
+Issue و Pull Request خوش‌آمدند! اگر باگی پیدا کردید یا ایده‌ای دارید، یک issue باز کنید و محیطتان را شرح دهید (نسخهٔ Ubuntu، بیلد CS2 و مراحل بازتولید).
+
+---
+
+## 👤 سازنده
+
+</div>
 
 <div align="center">
 
-**CS2Nexus** is designed and developed by
+**CS2Nexus** طراحی و توسعه داده شده توسط
 
 ## NEPENTII
-🇮🇷 *Iran*
+🇮🇷 *ایران*
 
 <br>
 
-If this project helps you, please ⭐ **star the repository**!
+اگر این پروژه به کارتان آمد، لطفاً به مخزن ⭐ **ستاره بدهید**!
 
 <br>
 
