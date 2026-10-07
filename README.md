@@ -1,6 +1,6 @@
 <div align="center">
 
-![CS2NEXUS Logo](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&logoColor=white](https://github.com/NEPENTII/CS2Nexus/blob/main/cs2nexus_logo.svg))
+![CS2NEXUS Logo](https://github.com/NEPENTII/CS2Nexus/blob/main/cs2nexus_logo.svg)
 
 ### The all-in-one Counter-Strike 2 server manager & launcher
 
