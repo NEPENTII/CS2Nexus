@@ -2,7 +2,7 @@
 
 ![CS2NEXUS Logo](https://github.com/NEPENTII/CS2Nexus/blob/main/cs2nexus_logo.svg)
 <p align="center">
-  <img src="https://github.com/NEPENTII/CS2Nexus/blob/main/cs2nexus_logo.svg" width="150" alt="CS2NEXUS Logo">
+  <img src="https://github.com/NEPENTII/CS2Nexus/blob/main/cs2nexus_logo.svg" width="400" alt="CS2NEXUS Logo">
 </p>
 ### The all-in-one Counter-Strike 2 server manager & launcher
 
