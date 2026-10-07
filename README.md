@@ -1,5 +1,7 @@
 <div align="center">
 
+**🌐 Language:** &nbsp; 🇬🇧 **English** &nbsp;|&nbsp; [🇮🇷 فارسی](README.fa.md)
+
 <img src="https://raw.githubusercontent.com/NEPENTII/CS2Nexus/main/cs2nexus_logo.svg" width="720" alt="CS2NEXUS Logo">
 
 <br>
