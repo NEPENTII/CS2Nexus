@@ -1045,12 +1045,139 @@ plugins_rows() {
     ] | @tsv' "$SHARED_DB"
 }
 
+# =============================================================================
+#  ASTRASKINS: ONE plugin, ONE config, ONE database for EVERY server
+#  - the plugin folder is the shared one (no per-server data folder)
+#  - configs/plugins/AstraSkins on every server is a link to shared/configs/AstraSkins
+#  - DatabaseMode is forced to "sqlite" (SQLite ships inside the plugin; nothing to install)
+#  Runs automatically with every plugin sync. Old per-server folders are moved to
+#  <server>/nexus-backup/ and never deleted.
+# =============================================================================
+readonly ASTRA_NAME="AstraSkins"
+readonly ASTRA_CFG_SHARED="$SHARED_DIR/configs/$ASTRA_NAME"
+ASTRA_NEEDS_RESTART=0
+
+astra_rel() { jq -r --arg n "$ASTRA_NAME" '[.[] | select(type=="object" and .name == $n)][0].path // empty' "$SHARED_DB" 2>/dev/null; }
+
+# registry: no per-server split, no include/exclude -> every server uses the one shared copy
+astra_prepare_registry() {
+    ((SHARED_OK)) || return 0
+    jq -e --arg n "$ASTRA_NAME" 'any(.[]; type=="object" and .name == $n and (((.local // []) | length) > 0 or ((.exclude // []) | length) > 0 or ((.include // []) | length) > 0))' "$SHARED_DB" >/dev/null 2>&1 || return 0
+    ((DRY_RUN)) && return 0
+    if shared_update --arg n "$ASTRA_NAME" 'map(if type=="object" and .name == $n then del(.local, .exclude, .include) else . end)' >/dev/null; then
+        info "$ASTRA_NAME is now shared by ALL servers (per-server data / exclusions removed)."
+    fi
+    return 0
+}
+
+# patch the one shared config: DatabaseMode=sqlite and a Sqlite.Path (keys matched case-insensitively)
+astra_patch_config() {
+    local f="$ASTRA_CFG_SHARED/$ASTRA_NAME.json" new tmp
+    [[ -f $f ]] || return 1
+    new=$(jq 'def ci($n): ((keys_unsorted | map(select(ascii_downcase == ($n | ascii_downcase))) | .[0]) // $n);
+        if type != "object" then error("not an object") else . end
+        | ci("DatabaseMode") as $dk | .[$dk] = "sqlite"
+        | ci("Sqlite") as $sk
+        | .[$sk] = ((if (.[$sk] | type) == "object" then .[$sk] else {} end)
+            | ci("Path") as $pk
+            | .[$pk] = (if ((.[$pk] // "") | tostring) == "" then "data/astra_skins.sqlite" else .[$pk] end))' "$f" 2>/dev/null) \
+        || { warn "$ASTRA_NAME.json is not valid JSON; not touched: $f"; return 1; }
+    if [[ $(jq -S . "$f" 2>/dev/null) == $(jq -S . <<<"$new") ]]; then return 0; fi
+    ((DRY_RUN)) && return 0
+    tmp="$f.tmp.$$"
+    printf '%s\n' "$new" >"$tmp" && chown "$CS2_USER:$CS2_GROUP" -- "$tmp" && mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; return 1; }
+    ok "$ASTRA_NAME config set to DatabaseMode=sqlite (shared by all servers)."
+    ASTRA_NEEDS_RESTART=1
+    return 0
+}
+
+# per loaded server (S_*): plugin folder + config folder
+astra_share_server() {
+    local rel base src plug cfgroot cfgd bk ts t
+    ((SHARED_OK)) || return 0
+    ((DRY_RUN)) && return 0
+    rel=$(astra_rel); [[ -n $rel ]] || return 0
+    validate_plugin_rel "$rel" 1 || return 0
+    safe_server_path "$S_PATH" "$S_SLUG" || return 0
+    base="$S_PATH/$CSGOREL"
+    [[ -d $base && ! -L $base ]] || return 0
+    src=$(plugin_src_path "$rel"); plug="$base/addons/$rel"
+    ts=$(date +%Y%m%d-%H%M%S)
+    bk="$S_PATH/nexus-backup/$ASTRA_NAME-$ts"
+
+    # 1) a real (local / split) plugin folder is replaced by the link to the shared one
+    if [[ -d $plug && ! -L $plug && -d $src ]] && ! paths_identical "$src" "$plug"; then
+        mkdir -p -- "$bk" && chown "$CS2_USER:$CS2_GROUP" -- "$S_PATH/nexus-backup" "$bk" 2>/dev/null
+        if mv -T -- "$plug" "$bk/plugin"; then
+            info "$S_NAME: its own $ASTRA_NAME folder was moved to $bk/plugin (the shared one is used now)."
+            ASTRA_NEEDS_RESTART=1
+        else
+            warn "$S_NAME: could not move the local $ASTRA_NAME folder; it stays per-server."
+        fi
+    fi
+
+    # 2) shared config folder
+    cfgroot="$base/addons/counterstrikesharp/configs/plugins"
+    cfgd="$cfgroot/$ASTRA_NAME"
+    install -d -m 755 -o "$CS2_USER" -g "$CS2_GROUP" -- "$SHARED_DIR/configs" "$ASTRA_CFG_SHARED" || return 0
+    if [[ -L $cfgd ]]; then
+        t=$(readlink -- "$cfgd")
+        [[ $t == "$ASTRA_CFG_SHARED" ]] && return 0
+        if [[ $t == "$SHARED_DIR"/* || ! -e $cfgd ]]; then ln -sfT -- "$ASTRA_CFG_SHARED" "$cfgd" && chown -h "$CS2_USER:$CS2_GROUP" -- "$cfgd"; return 0; fi
+        warn "$S_NAME: $ASTRA_NAME config folder is a link to somewhere else ($t); left alone."; return 0
+    fi
+    if [[ -e $cfgd && ! -d $cfgd ]]; then warn "$S_NAME: a file blocks the $ASTRA_NAME config folder."; return 0; fi
+    if [[ -d $cfgd ]]; then
+        # the first config found becomes the shared one
+        if [[ -f $cfgd/$ASTRA_NAME.json && ! -f $ASTRA_CFG_SHARED/$ASTRA_NAME.json ]]; then
+            cp -p -- "$cfgd/$ASTRA_NAME.json" "$ASTRA_CFG_SHARED/$ASTRA_NAME.json" && chown "$CS2_USER:$CS2_GROUP" -- "$ASTRA_CFG_SHARED/$ASTRA_NAME.json"
+        fi
+        mkdir -p -- "$bk" && chown "$CS2_USER:$CS2_GROUP" -- "$S_PATH/nexus-backup" "$bk" 2>/dev/null
+        mv -T -- "$cfgd" "$bk/config" || { warn "$S_NAME: could not move the local $ASTRA_NAME config folder."; return 0; }
+        ASTRA_NEEDS_RESTART=1
+    fi
+    if ensure_chain "$base" "$cfgroot" && ln -s -- "$ASTRA_CFG_SHARED" "$cfgd" && chown -h "$CS2_USER:$CS2_GROUP" -- "$cfgd"; then
+        info "$S_NAME: $ASTRA_NAME config is the shared one."
+    else
+        warn "$S_NAME: could not link the shared $ASTRA_NAME config."
+    fi
+    return 0
+}
+
+# the config does not exist before the plugin runs once: when it appears, patch it and reload the plugin
+astra_config_watch() {   # <server id>
+    local id=$1 f="$ASTRA_CFG_SHARED/$ASTRA_NAME.json"
+    [[ -n $(astra_rel) ]] || return 0
+    [[ -f $f ]] && { astra_patch_config; return 0; }
+    (
+        local i
+        for ((i = 0; i < 40; i++)); do
+            sleep 3
+            [[ -f $f ]] || continue
+            sleep 1
+            ASTRA_NEEDS_RESTART=0
+            astra_patch_config >/dev/null 2>&1 && ((ASTRA_NEEDS_RESTART)) && is_running "$id" && console_send "$id" "css_plugins reload $ASTRA_NAME" >/dev/null 2>&1
+            exit 0
+        done
+    ) </dev/null >/dev/null 2>&1 7>&- 8>&- 9>&- &
+    disown 2>/dev/null
+    return 0
+}
+
+astra_report_restart() {
+    ((ASTRA_NEEDS_RESTART)) || return 0
+    warn "$ASTRA_NAME was switched to the shared folder/config: RESTART the running servers once (Restart Server) so they use it."
+    ASTRA_NEEDS_RESTART=0
+}
+
 # Sync ALL shared plugins to the currently loaded server (S_*)
 sync_shared_current() {
     local P_NAME P_PATH P_LOCAL P_EXCL P_INCL rc=0
     ((SHARED_OK)) || return 1
     need_layout || return 1
     lock_ops 30 || return 1
+    astra_prepare_registry
+    astra_share_server
     while IFS=$'\t' read -r P_NAME P_PATH P_LOCAL P_EXCL P_INCL; do
         if ! validate_plugin_rel "$P_PATH" 1; then
             warn "Ignoring invalid shared plugin path in registry: $P_PATH"
@@ -1130,7 +1257,7 @@ sync_shared_all() {
         fi
         sync_shared_current || rc=1
     done
-    ((DRY_RUN)) || { aliases_deploy quiet; admins_deploy_defaults quiet; }
+    ((DRY_RUN)) || { aliases_deploy quiet; admins_deploy_defaults quiet; astra_patch_config || true; astra_report_restart; }
     unlock_ops
     return $rc
 }
@@ -1443,6 +1570,7 @@ start_server() {
         DRY_RUN=0
         discover_shared_plugins
         sync_shared_current || warn "Some shared plugins could not be synchronised safely (see above). Existing files were left untouched."
+        astra_config_watch "$id"; ASTRA_NEEDS_RESTART=0
     else
         warn "Shared plugin registry is invalid; skipping shared plugin sync."
     fi
@@ -4090,12 +4218,11 @@ valid_local_path() {
     return 0
 }
 
-# Plugin data that must stay per-server. AstraSkins keeps its sqlite database
-# inside data/ next to static json catalogs, so only that file is per-server.
+# Plugin data that must stay per-server (AstraSkins is deliberately fully shared, see astra_* below).
 plugin_profile_local() {   # <name> -> csv | -
     local d
     case $1 in
-        AstraSkins) echo "data/astra_skins.sqlite"; return ;;
+        AstraSkins) echo "-"; return ;;   # one shared database for every server
         FakeBan|ServerCommands) echo "data"; return ;;
     esac
     d=$(st_get 0 | jq -r '(.plugins.local // []) | join(",")' 2>/dev/null)

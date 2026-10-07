@@ -1,0 +1,30 @@
+[
+  {
+    "id": "pistols",
+    "displayName": "Pistols",
+    "displayNameZh": "手枪",
+    "order": 10,
+    "enabled": true
+  },
+  {
+    "id": "smgs",
+    "displayName": "SMGs",
+    "displayNameZh": "微型冲锋枪",
+    "order": 20,
+    "enabled": true
+  },
+  {
+    "id": "rifles",
+    "displayName": "Rifles",
+    "displayNameZh": "步枪",
+    "order": 30,
+    "enabled": true
+  },
+  {
+    "id": "heavy",
+    "displayName": "Heavy",
+    "displayNameZh": "重型武器",
+    "order": 40,
+    "enabled": true
+  }
+]

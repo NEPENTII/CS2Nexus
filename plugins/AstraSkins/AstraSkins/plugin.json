@@ -1,0 +1,8 @@
+{
+  "name": "AstraSkins",
+  "version": "1.2.2",
+  "author": "Ayrton09 (packaged for CS2Nexus)",
+  "description": "Skins, knives, gloves, agents, music kits, stickers and charms menu. CS2Nexus runs ONE copy, ONE config and ONE SQLite database for all servers (SQLite is bundled, nothing to install).",
+  "commands": [],
+  "configs": ["AstraSkins.json"]
+}
