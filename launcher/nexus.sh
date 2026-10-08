@@ -1082,7 +1082,7 @@ astra_patch_config() {
             | ci("Path") as $pk
             | .[$pk] = (if ((.[$pk] // "") | tostring) == "" then "data/astra_skins.sqlite" else .[$pk] end))' "$f" 2>/dev/null) \
         || { warn "$ASTRA_NAME.json is not valid JSON; not touched: $f"; return 1; }
-    if [[ $(jq -S . "$f" 2>/dev/null) == $(jq -S . <<<"$new") ]]; then return 0; fi
+    if [[ $(jq -S . "$f" 2>/dev/null) == "$(jq -S . <<<"$new")" ]]; then return 0; fi
     ((DRY_RUN)) && return 0
     tmp="$f.tmp.$$"
     printf '%s\n' "$new" >"$tmp" && chown "$CS2_USER:$CS2_GROUP" -- "$tmp" && mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; return 1; }
@@ -1178,6 +1178,7 @@ sync_shared_current() {
     lock_ops 30 || return 1
     astra_prepare_registry
     astra_share_server
+    panel_write_plugin_config_current
     while IFS=$'\t' read -r P_NAME P_PATH P_LOCAL P_EXCL P_INCL; do
         if ! validate_plugin_rel "$P_PATH" 1; then
             warn "Ignoring invalid shared plugin path in registry: $P_PATH"
@@ -2421,10 +2422,12 @@ maintenance_menu() {
         echo "1) Update CS2 (SteamCMD, safe)"
         echo "2) Scheduled restart"
         echo "3) Watchdog / autostart"
-        echo "4) JSON backups"
-        echo "5) Update launcher"
-        echo "6) Launcher settings"
-        echo "7) Back"
+        echo "4) JSON backups (small registry copies)"
+        echo "5) Data backups (AstraSkins, bans, admins, settings, panel)"
+        echo "6) Resource alerts (CPU / RAM / disk limits)"
+        echo "7) Update launcher"
+        echo "8) Launcher settings"
+        echo "9) Back"
         echo
         read -r -p "Select: " c || exit 0
         case "$(trim "$c")" in
@@ -2432,9 +2435,729 @@ maintenance_menu() {
             2) sched_menu ;;
             3) watchdog_menu ;;
             4) backups_ui; pause ;;
-            5) update_launcher_ui; pause ;;
-            6) launcher_settings_ui ;;
-            7|q|Q) return ;;
+            5) backups_full_menu ;;
+            6) alerts_menu ;;
+            7) update_launcher_ui; pause ;;
+            8) launcher_settings_ui ;;
+            9|q|Q) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+#  EXTRA FEATURE SETTINGS  (own file: values may contain ? = & and so on)
+# =============================================================================
+readonly FX_FILE="$SHARED_DIR/nexus-features.conf"
+fx_get() {   # <KEY> [default]
+    local v
+    v=$(grep -m1 "^$1=" "$FX_FILE" 2>/dev/null | cut -d= -f2-)
+    printf '%s' "${v:-${2:-}}"
+}
+fx_set() {   # <KEY> <value>
+    local k=$1 v=$2 tmp
+    [[ $k =~ ^[A-Z0-9_]+$ ]] || return 1
+    [[ $v != *$'\n'* && $v != *$'\r'* ]] || { err "No line breaks allowed."; return 1; }
+    install -d -m 755 -- "$(dirname -- "$FX_FILE")" 2>/dev/null
+    tmp=$(mktemp "$FX_FILE.XXXXXX") || return 1
+    { [[ -f $FX_FILE ]] && grep -v "^$k=" "$FX_FILE"; printf '%s=%s\n' "$k" "$v"; } >"$tmp"
+    chmod 600 "$tmp"
+    mv -f -- "$tmp" "$FX_FILE" || { rm -f -- "$tmp"; return 1; }
+}
+fx_num() {   # <KEY> <default> <min> <max> -> value (falls back to default when invalid)
+    local v; v=$(fx_get "$1" "$2")
+    [[ $v =~ ^[0-9]+$ ]] && ((10#$v >= $3 && 10#$v <= $4)) || v=$2
+    printf '%s' "$((10#$v))"
+}
+ask_num() {   # <prompt> <current> <min> <max>  -> ANSWER
+    local a
+    while :; do
+        read -r -p "$1 [$2]: " a || exit 0
+        a=$(trim "$a"); [[ -z $a ]] && a=$2
+        if [[ $a =~ ^[0-9]+$ ]] && ((10#$a >= $3 && 10#$a <= $4)); then ANSWER=$((10#$a)); return 0; fi
+        err "Enter a number from $3 to $4."
+    done
+}
+
+# =============================================================================
+#  DATA BACKUPS  (rotating .tar.gz: AstraSkins, bans, admins, settings, panel data)
+# =============================================================================
+readonly BK_ROOT="/opt/cs2-backups"
+readonly BK_UNIT="cs2nexus-backup"
+readonly PANEL_DIR="/opt/cs2-panel"
+
+bk_keep() { fx_num BACKUP_KEEP 14 1 365; }
+
+# every path (file or folder) that holds data worth keeping; only existing ones are printed
+bk_collect() {
+    local p id row spath rel
+    local -a list=("$DB" "$FX_FILE" "$CONF_FILE" "$SHARED_DIR/configs" "$PANEL_DIR/data")
+    for p in "$SHARED_DIR"/*.json; do list+=("$p"); done
+    rel=$(astra_rel 2>/dev/null)
+    [[ -n $rel ]] && list+=("$SHARED_ADDONS/$rel/data/astra_skins.sqlite")
+    while IFS=$'\t' read -r id spath; do
+        [[ -n $spath ]] || continue
+        local b="$spath/$CSGOREL"
+        list+=("$b/addons/counterstrikesharp/configs/admins.json" "$b/addons/counterstrikesharp/configs/ServerCommandsAdmins.json"
+               "$b/addons/counterstrikesharp/plugins/ServerCommands/data" "$b/addons/counterstrikesharp/plugins/FakeBan/data"
+               "$b/addons/counterstrikesharp/configs/plugins/NexusLink" "$b/cfg/server.cfg" "$b/cfg/cs2nexus_settings.cfg")
+    done < <(jq -r '.[] | [.id, .path] | @tsv' "$DB" 2>/dev/null)
+    for p in "${list[@]}"; do [[ -e $p ]] && printf '%s\n' "$p"; done
+}
+
+bk_sqlite_copy() {   # <src> <dst>: consistent copy of a database that may be in use
+    local s=$1 d=$2
+    if command -v python3 >/dev/null 2>&1 && python3 -c '
+import sqlite3, sys, urllib.parse as u
+src = sqlite3.connect("file:" + u.quote(sys.argv[1]) + "?mode=ro", uri=True)
+dst = sqlite3.connect(sys.argv[2]); src.backup(dst); dst.close(); src.close()' "$s" "$d" 2>/dev/null; then return 0; fi
+    cp -a -- "$s" "$d"
+}
+
+# backup_run [label]  -> creates $BK_ROOT/cs2nexus-<label>-<time>.tar.gz and rotates the old ones
+backup_run() {
+    local label=${1:-auto} stage out tmp p dst n=0 keep
+    install -d -m 700 -- "$BK_ROOT" || { err "Cannot create $BK_ROOT"; return 1; }
+    stage=$(mktemp -d "$BK_ROOT/.stage.XXXXXX") || return 1
+    while IFS= read -r p; do
+        dst="$stage$p"
+        mkdir -p -- "$(dirname -- "$dst")"
+        case $p in
+            *.sqlite|*.sqlite3|*.db) bk_sqlite_copy "$p" "$dst" ;;
+            *) cp -a -- "$p" "$dst" ;;
+        esac && n=$((n + 1))
+        # databases inside folders (panel.db) are copied consistently as well
+        if [[ -d $p ]]; then
+            while IFS= read -r -d '' f; do bk_sqlite_copy "$f" "$stage$f"; done < <(find "$p" -type f \( -name '*.db' -o -name '*.sqlite' \) -print0 2>/dev/null)
+            find "$stage$p" -type f \( -name '*-wal' -o -name '*-shm' -o -name '*-journal' \) -delete 2>/dev/null
+        fi
+    done < <(bk_collect)
+    out="$BK_ROOT/cs2nexus-$label-$(date +%Y%m%d-%H%M%S).tar.gz"
+    tmp="$out.part"
+    if tar -C "$stage" -czpf "$tmp" . 2>/dev/null && mv -f -- "$tmp" "$out"; then
+        chmod 600 "$out"
+        ok "Backup created: $out ($(du -h -- "$out" | cut -f1), $n item(s))"
+    else
+        rm -f -- "$tmp"; rm -rf --one-file-system -- "$stage"; err "Backup failed."; return 1
+    fi
+    rm -rf --one-file-system -- "$stage"
+    # rotation: automatic/manual backups use the setting; pre-restore safety copies keep the last 5
+    keep=$(bk_keep)
+    ls -1t -- "$BK_ROOT"/cs2nexus-auto-*.tar.gz "$BK_ROOT"/cs2nexus-manual-*.tar.gz 2>/dev/null | tail -n +"$((keep + 1))" | while IFS= read -r p; do rm -f -- "$p"; done
+    ls -1t -- "$BK_ROOT"/cs2nexus-prerestore-*.tar.gz 2>/dev/null | tail -n +6 | while IFS= read -r p; do rm -f -- "$p"; done
+    return 0
+}
+
+bk_list() {   # prints "file<TAB>size<TAB>date", newest first
+    local f
+    ls -1t -- "$BK_ROOT"/cs2nexus-*.tar.gz 2>/dev/null | while IFS= read -r f; do
+        printf '%s\t%s\t%s\n' "$f" "$(du -h -- "$f" | cut -f1)" "$(date -d "@$(stat -c %Y -- "$f")" '+%Y-%m-%d %H:%M')"
+    done
+}
+
+# scope filter for a restore: prints a grep -E pattern matching the paths (inside the archive, "./abs/path")
+bk_scope_pattern() {
+    case $1 in
+        all)      echo '.' ;;
+        astra)    echo '(AstraSkins|astra_skins)' ;;
+        bans)     echo '/(ServerCommands|FakeBan)/data/' ;;
+        admins)   echo '/configs/(admins\.json|ServerCommandsAdmins\.json)$' ;;
+        settings) echo "^\\./($(printf '%s' "${DB#/}" | sed 's/[.]/\\./g')|${SHARED_DIR#/}/[^/]*\\.json|${SHARED_DIR#/}/nexus-features\\.conf|etc/cs2nexus\\.conf)|/cfg/(server|cs2nexus_settings)\\.cfg\$" ;;
+        panel)    echo "^\\./${PANEL_DIR#/}/data|/configs/plugins/NexusLink/" ;;
+    esac
+}
+
+backup_restore_ui() {
+    local -a files=() lines=() sel
+    local n c f scope pat tmp cnt=0 rows run
+    mapfile -t lines < <(bk_list)
+    if ((${#lines[@]} == 0)); then warn "No backups yet (folder: $BK_ROOT)."; return; fi
+    header "RESTORE A BACKUP"
+    n=0
+    for c in "${lines[@]}"; do
+        n=$((n + 1)); IFS=$'\t' read -r f sz dt <<<"$c"; files+=("$f")
+        printf '  %2d) %s   %s   %s\n' "$n" "$dt" "$sz" "${f##*/}"
+        ((n >= 30)) && break
+    done
+    echo "   b) Back"; echo
+    read -r -p "Backup to restore: " c || exit 0
+    c=$(trim "$c"); [[ $c == b || $c == B || -z $c ]] && return
+    if ! [[ $c =~ ^[0-9]+$ ]] || ((10#$c < 1 || 10#$c > ${#files[@]})); then err "Invalid option."; return; fi
+    f=${files[$((10#$c - 1))]}
+    echo
+    echo "  What do you want to restore?"
+    echo "   1) Everything"
+    echo "   2) AstraSkins (database + config)"
+    echo "   3) Bans & punishments (ServerCommands / FakeBan data)"
+    echo "   4) Admin files"
+    echo "   5) Server list, settings, registries and server.cfg"
+    echo "   6) Web panel data"
+    echo "   b) Back"; echo
+    read -r -p "Select: " c || exit 0
+    case "$(trim "$c")" in
+        1) scope=all ;; 2) scope=astra ;; 3) scope=bans ;; 4) scope=admins ;; 5) scope=settings ;; 6) scope=panel ;;
+        *) return ;;
+    esac
+    run=$(jq -r '.[].id' "$DB" 2>/dev/null | while read -r i; do is_running "$i" && printf '%s ' "$i"; done)
+    if [[ -n $run ]]; then
+        err "These servers are running: $run"
+        echo "  Stop them first (Stop Server), then restore. Restoring under a running server does not work reliably."
+        return
+    fi
+    pat=$(bk_scope_pattern "$scope")
+    tmp=$(mktemp -d "$BK_ROOT/.restore.XXXXXX") || return
+    if ! tar -C "$tmp" -xzpf "$f" 2>/dev/null; then err "The archive could not be read."; rm -rf --one-file-system -- "$tmp"; return; fi
+    mapfile -t sel < <(cd "$tmp" && find . -type f -print | grep -E -- "$pat")
+    if ((${#sel[@]} == 0)); then warn "This backup holds nothing for that choice."; rm -rf --one-file-system -- "$tmp"; return; fi
+    echo "  ${#sel[@]} file(s) will be restored (existing files with the same path are replaced)."
+    confirm_yn "Continue? A safety backup of the current state is made first. [y/N]: " n || { rm -rf --one-file-system -- "$tmp"; return; }
+    backup_run prerestore || { err "Safety backup failed; nothing restored."; rm -rf --one-file-system -- "$tmp"; return; }
+    for c in "${sel[@]}"; do
+        c=${c#.}
+        [[ $c == /* && $c != *..* ]] || continue
+        mkdir -p -- "$(dirname -- "$c")"
+        if cp -a -- "$tmp$c" "$c"; then cnt=$((cnt + 1)); fi
+    done
+    rm -rf --one-file-system -- "$tmp"
+    ok "Restored $cnt file(s). Start your servers again."
+    [[ $scope == all || $scope == settings ]] && info "Run 'Plugins -> Sync' once so every server picks up its files."
+}
+
+backup_timer_install() {
+    command -v systemctl >/dev/null 2>&1 || { err "systemctl is not available."; return 1; }
+    local hour; hour=$(fx_num BACKUP_HOUR 4 0 23)
+    cat >"/etc/systemd/system/$BK_UNIT.service" <<EOF
+[Unit]
+Description=CS2Nexus data backup
+
+[Service]
+Type=oneshot
+ExecStart=$SELF backup
+EOF
+    cat >"/etc/systemd/system/$BK_UNIT.timer" <<EOF
+[Unit]
+Description=Daily CS2Nexus data backup
+
+[Timer]
+OnCalendar=*-*-* $(printf '%02d' "$hour"):30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    if systemctl daemon-reload && systemctl enable --now "$BK_UNIT.timer" >/dev/null 2>&1; then
+        fx_set BACKUP_AUTO 1; ok "Automatic backup enabled (every day at $(printf '%02d' "$hour"):30)."
+    else err "Could not enable the backup timer."; return 1; fi
+}
+backup_timer_remove() {
+    command -v systemctl >/dev/null 2>&1 && systemctl disable --now "$BK_UNIT.timer" >/dev/null 2>&1
+    rm -f -- "/etc/systemd/system/$BK_UNIT.service" "/etc/systemd/system/$BK_UNIT.timer"
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload
+    fx_set BACKUP_AUTO 0; ok "Automatic backup disabled."
+}
+
+backups_full_menu() {
+    local c n a
+    while :; do
+        clear_screen; dsep
+        printf '%s              DATA BACKUPS%s\n' "$BOLD" "$RESET"; dsep; echo
+        a=$(systemctl is-active "$BK_UNIT.timer" 2>/dev/null || echo no)
+        n=$(bk_list | wc -l)
+        printf '  Folder        : %s\n  Backups       : %s (keeps the newest %s)\n  Automatic     : %s (daily %02d:30)\n\n' \
+            "$BK_ROOT" "$n" "$(bk_keep)" "$([[ $a == active ]] && echo ON || echo OFF)" "$(fx_num BACKUP_HOUR 4 0 23)"
+        echo "  Saved: AstraSkins database/config, bans & punishments, admin files, server list,"
+        echo "         settings, plugin registries, server.cfg and the web panel data."
+        echo
+        echo "  1) Back up now"
+        echo "  2) Turn automatic daily backup ON / OFF"
+        echo "  3) Change time and how many to keep"
+        echo "  4) List backups"
+        echo "  5) Restore a backup"
+        echo "  6) Back"
+        echo
+        read -r -p "Select: " c || exit 0
+        case "$(trim "$c")" in
+            1) backup_run manual; pause ;;
+            2) if [[ $a == active ]]; then backup_timer_remove; else backup_timer_install; fi; pause ;;
+            3) ask_num "Hour of the day (0-23)" "$(fx_num BACKUP_HOUR 4 0 23)" 0 23; fx_set BACKUP_HOUR "$ANSWER"
+               ask_num "How many backups to keep" "$(bk_keep)" 1 365; fx_set BACKUP_KEEP "$ANSWER"
+               [[ $a == active ]] && backup_timer_install; pause ;;
+            4) bk_list | awk -F'\t' '{printf "  %s  %6s  %s\n", $3, $2, $1}'; pause ;;
+            5) backup_restore_ui; pause ;;
+            6|q|Q) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+#  RESOURCE ALERTS  (timer every minute; log + optional Discord-style webhook / Telegram)
+# =============================================================================
+readonly AL_UNIT="cs2nexus-alerts"
+readonly AL_LOG="/var/log/cs2nexus-alerts.log"
+readonly AL_STATE="$STATE_DIR/alerts.state"
+
+alert_send() {   # <text>   (never fails the caller)
+    local msg=$1 url tok chat
+    printf '%s %s\n' "$(date '+%F %T')" "$msg" >>"$AL_LOG" 2>/dev/null
+    if [[ -f $AL_LOG ]] && (($(stat -c %s "$AL_LOG" 2>/dev/null || echo 0) > 1048576)); then tail -n 2000 "$AL_LOG" >"$AL_LOG.tmp" && mv -f "$AL_LOG.tmp" "$AL_LOG"; fi
+    command -v logger >/dev/null 2>&1 && logger -t cs2nexus-alert -- "$msg"
+    msg="[$(hostname)] $msg"
+    url=$(fx_get ALERT_WEBHOOK)
+    if [[ -n $url ]]; then
+        curl -fsS -m 10 -H 'Content-Type: application/json' -d "$(jq -nc --arg c "$msg" '{content:$c, text:$c}')" "$url" >/dev/null 2>&1 || true
+    fi
+    tok=$(fx_get ALERT_TG_TOKEN); chat=$(fx_get ALERT_TG_CHAT)
+    if [[ -n $tok && -n $chat ]]; then
+        curl -fsS -m 10 "https://api.telegram.org/bot$tok/sendMessage" --data-urlencode "chat_id=$chat" --data-urlencode "text=$msg" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+# one check (called every minute by the timer). A value must stay over its limit for ALERT_SUSTAIN
+# checks in a row before an alert is sent; the same alert repeats at most every ALERT_COOLDOWN minutes.
+alert_check() {
+    [[ $(fx_get ALERT_ENABLED 0) == 1 ]] || return 0
+    local lim_cpu lim_ram lim_disk sustain cool now
+    lim_cpu=$(fx_num ALERT_CPU 90 1 100); lim_ram=$(fx_num ALERT_RAM 90 1 100); lim_disk=$(fx_num ALERT_DISK 90 1 100)
+    sustain=$(fx_num ALERT_SUSTAIN 3 1 60); cool=$(fx_num ALERT_COOLDOWN 30 1 1440); now=$(date +%s)
+    local -A st_streak=() st_last=() st_on=() prev=() cur=() val=() lim=() label=()
+    local line k a b c
+    if [[ -f $AL_STATE ]]; then
+        while read -r k line; do
+            case $k in
+                P:*) prev[${k#P:}]="$line" ;;
+                S:*) read -r a b c <<<"$line"; st_streak[${k#S:}]=$a; st_last[${k#S:}]=$b; st_on[${k#S:}]=$c ;;
+            esac
+        done <"$AL_STATE"
+    fi
+    local tick cores memtot memavail dfp tot idle t0
+    tick=$(getconf CLK_TCK 2>/dev/null || echo 100); cores=$(nproc 2>/dev/null || echo 1)
+    memtot=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); memavail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+    read -r tot idle < <(awk '/^cpu /{ t = 0; for (i = 2; i <= NF; i++) t += $i; print t, $5 + $6 }' /proc/stat)
+    # system CPU since the previous check
+    cur[sys]="$tot $idle $now"
+    if [[ -n ${prev[sys]:-} ]]; then
+        read -r pt pi pn <<<"${prev[sys]}"
+        if ((tot > pt)); then val[cpu]=$(( 100 * ((tot - pt) - (idle - pi)) / (tot - pt) )); fi
+    fi
+    val[ram]=$(( (memtot - memavail) * 100 / (memtot > 0 ? memtot : 1) ))
+    dfp=$(df -P "$SERVERS_DIR" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}'); [[ $dfp =~ ^[0-9]+$ ]] && val[disk]=$dfp
+    lim[cpu]=$lim_cpu; lim[ram]=$lim_ram; lim[disk]=$lim_disk
+    label[cpu]="CPU of the machine"; label[ram]="RAM of the machine"; label[disk]="Disk ($SERVERS_DIR)"
+    # every running server: its share of the machine
+    local snap id name pid ticks pages ramp cpup
+    snap=$(mktemp) && mon_snapshot >"$snap"
+    while IFS=$'\t' read -r id name; do
+        pid=$(tmux_cs2 list-panes -t "=$(session_name "$id"):" -F '#{pane_pid}' 2>/dev/null | head -n 1)
+        [[ -n $pid ]] || continue
+        read -r ticks pages < <(mon_sum "$snap" "$pid")
+        ramp=$(( pages * $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 * 100 / (memtot > 0 ? memtot : 1) ))
+        val[s${id}ram]=$ramp; lim[s${id}ram]=$lim_ram; label[s${id}ram]="Server '$name' RAM (share of the machine)"
+        cur[s$id]="$ticks $now"
+        if [[ -n ${prev[s$id]:-} ]]; then
+            read -r pt pn <<<"${prev[s$id]}"
+            if ((now > pn)); then
+                cpup=$(awk -v d="$((ticks - pt))" -v tk="$tick" -v s="$((now - pn))" -v c="$cores" 'BEGIN{ v = d / tk / s * 100 / c; if (v < 0) v = 0; printf "%d", v }')
+                val[s${id}cpu]=$cpup; lim[s${id}cpu]=$lim_cpu; label[s${id}cpu]="Server '$name' CPU (share of the machine)"
+            fi
+        fi
+    done < <(jq -r '.[] | [.id, .name] | @tsv' "$DB" 2>/dev/null)
+    rm -f -- "$snap"
+    for k in "${!val[@]}"; do
+        if ((val[$k] >= lim[$k])); then
+            st_streak[$k]=$(( ${st_streak[$k]:-0} + 1 ))
+            if ((st_streak[$k] >= sustain)) && ((now - ${st_last[$k]:-0} >= cool * 60)); then
+                alert_send "ALERT: ${label[$k]} is at ${val[$k]}% (limit ${lim[$k]}%, for ${st_streak[$k]} min)."
+                st_last[$k]=$now; st_on[$k]=1
+            fi
+        else
+            if [[ ${st_on[$k]:-0} == 1 ]]; then alert_send "OK again: ${label[$k]} is back to ${val[$k]}%."; fi
+            st_streak[$k]=0; st_on[$k]=0
+        fi
+    done
+    for k in "${!st_streak[@]}"; do   # a value that is no longer measured (server stopped) is forgotten silently
+        [[ -n ${val[$k]+x} ]] || { st_streak[$k]=0; st_on[$k]=0; }
+    done
+    {
+        for k in "${!cur[@]}"; do printf 'P:%s %s\n' "$k" "${cur[$k]}"; done
+        for k in "${!st_streak[@]}"; do printf 'S:%s %s %s %s\n' "$k" "${st_streak[$k]}" "${st_last[$k]:-0}" "${st_on[$k]:-0}"; done
+    } >"$AL_STATE.tmp" && mv -f -- "$AL_STATE.tmp" "$AL_STATE"
+    return 0
+}
+
+alert_timer_install() {
+    command -v systemctl >/dev/null 2>&1 || { err "systemctl is not available."; return 1; }
+    cat >"/etc/systemd/system/$AL_UNIT.service" <<EOF
+[Unit]
+Description=CS2Nexus resource alert check
+
+[Service]
+Type=oneshot
+ExecStart=$SELF alert-check
+EOF
+    cat >"/etc/systemd/system/$AL_UNIT.timer" <<EOF
+[Unit]
+Description=CS2Nexus resource alert check every minute
+
+[Timer]
+OnActiveSec=30
+OnUnitActiveSec=60
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+    if systemctl daemon-reload && systemctl enable --now "$AL_UNIT.timer" >/dev/null 2>&1; then
+        fx_set ALERT_ENABLED 1; ok "Resource alerts are ON (checked every minute)."
+    else err "Could not enable the alert timer."; return 1; fi
+}
+alert_timer_remove() {
+    command -v systemctl >/dev/null 2>&1 && systemctl disable --now "$AL_UNIT.timer" >/dev/null 2>&1
+    rm -f -- "/etc/systemd/system/$AL_UNIT.service" "/etc/systemd/system/$AL_UNIT.timer" "$AL_STATE"
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload
+    fx_set ALERT_ENABLED 0; ok "Resource alerts are OFF."
+}
+
+alerts_menu() {
+    local c v
+    while :; do
+        clear_screen; dsep
+        printf '%s              RESOURCE ALERTS%s\n' "$BOLD" "$RESET"; dsep; echo
+        printf '  State          : %s\n' "$([[ $(fx_get ALERT_ENABLED 0) == 1 ]] && echo "${GREEN}ON${RESET}" || echo "${RED}OFF${RESET}")"
+        printf '  Limits         : CPU %s%%   RAM %s%%   Disk %s%%\n' "$(fx_num ALERT_CPU 90 1 100)" "$(fx_num ALERT_RAM 90 1 100)" "$(fx_num ALERT_DISK 90 1 100)"
+        printf '  Alert when     : over the limit for %s minute(s) in a row; the same alert repeats at most every %s min\n' "$(fx_num ALERT_SUSTAIN 3 1 60)" "$(fx_num ALERT_COOLDOWN 30 1 1440)"
+        printf '  Also checks    : every running server (its share of the machine, same CPU/RAM limits)\n'
+        printf '  Log file       : %s\n' "$AL_LOG"
+        v=$(fx_get ALERT_WEBHOOK); printf '  Webhook        : %s\n' "${v:+set}${v:-not set}"
+        v=$(fx_get ALERT_TG_TOKEN); printf '  Telegram       : %s\n\n' "$([[ -n $v && -n $(fx_get ALERT_TG_CHAT) ]] && echo set || echo 'not set')"
+        echo "  1) Turn alerts ON / OFF"
+        echo "  2) Change the limits (CPU, RAM, disk)"
+        echo "  3) Change how long / how often"
+        echo "  4) Set the webhook (Discord or any URL that accepts JSON)"
+        echo "  5) Set Telegram (bot token + chat id)"
+        echo "  6) Send a test alert"
+        echo "  7) Show the alert log"
+        echo "  8) Back"
+        echo
+        read -r -p "Select: " c || exit 0
+        case "$(trim "$c")" in
+            1) if [[ $(fx_get ALERT_ENABLED 0) == 1 ]]; then alert_timer_remove; else alert_timer_install; fi; pause ;;
+            2) ask_num "CPU limit %" "$(fx_num ALERT_CPU 90 1 100)" 1 100; fx_set ALERT_CPU "$ANSWER"
+               ask_num "RAM limit %" "$(fx_num ALERT_RAM 90 1 100)" 1 100; fx_set ALERT_RAM "$ANSWER"
+               ask_num "Disk limit %" "$(fx_num ALERT_DISK 90 1 100)" 1 100; fx_set ALERT_DISK "$ANSWER"; ok "Saved."; pause ;;
+            3) ask_num "Minutes over the limit before an alert" "$(fx_num ALERT_SUSTAIN 3 1 60)" 1 60; fx_set ALERT_SUSTAIN "$ANSWER"
+               ask_num "Repeat the same alert at most every (minutes)" "$(fx_num ALERT_COOLDOWN 30 1 1440)" 1 1440; fx_set ALERT_COOLDOWN "$ANSWER"; ok "Saved."; pause ;;
+            4) read -r -p "Webhook URL (empty = remove): " v || exit 0; v=$(trim "$v")
+               if [[ -z $v || $v =~ ^https?://[^[:space:]]+$ ]]; then fx_set ALERT_WEBHOOK "$v"; ok "Saved."; else err "That is not an http(s) URL."; fi; pause ;;
+            5) read -r -p "Telegram bot token (empty = remove): " v || exit 0; v=$(trim "$v")
+               if [[ -z $v ]]; then fx_set ALERT_TG_TOKEN ""; fx_set ALERT_TG_CHAT ""; ok "Removed."
+               elif [[ $v =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+                   fx_set ALERT_TG_TOKEN "$v"; read -r -p "Chat id: " v || exit 0; v=$(trim "$v")
+                   [[ $v =~ ^-?[0-9]+$ ]] && { fx_set ALERT_TG_CHAT "$v"; ok "Saved."; } || err "The chat id is a number."
+               else err "That does not look like a bot token."; fi; pause ;;
+            6) alert_send "TEST: this is a test alert from CS2Nexus."; ok "Sent (log, journal$([[ -n $(fx_get ALERT_WEBHOOK) ]] && echo ', webhook')$([[ -n $(fx_get ALERT_TG_TOKEN) ]] && echo ', Telegram'))."; pause ;;
+            7) if [[ -s $AL_LOG ]]; then tail -n 30 "$AL_LOG"; else info "The log is empty."; fi; pause ;;
+            8|q|Q) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+#  WEB PANEL  (players' website: login with !getcode, live servers, history, matches)
+#  The panel files and the NexusLink plugin are built into this launcher.
+# =============================================================================
+readonly PANEL_UNIT="cs2nexus-panel"
+readonly PANEL_VERSION="1.0.0"
+readonly PANEL_SETTINGS="$PANEL_DIR/data/settings.json"
+
+panel_installed() { [[ -f $PANEL_DIR/app/server.py && -f $PANEL_SETTINGS ]]; }
+panel_get() { jq -r --arg k "$1" '.[$k] // empty' "$PANEL_SETTINGS" 2>/dev/null; }
+panel_set() {   # <key> <json value>
+    local tmp
+    tmp=$(mktemp "$PANEL_SETTINGS.XXXXXX") || return 1
+    if jq --arg k "$1" --argjson v "$2" '.[$k] = $v' "$PANEL_SETTINGS" >"$tmp" 2>/dev/null; then
+        chown "root:$CS2_GROUP" "$tmp"; chmod 640 "$tmp"; mv -f -- "$tmp" "$PANEL_SETTINGS"
+    else rm -f -- "$tmp"; return 1; fi
+}
+panel_running() { systemctl is-active --quiet "$PANEL_UNIT.service" 2>/dev/null; }
+panel_host() {
+    local h; h=$(panel_get domain)
+    [[ -n $h ]] || h=$(hostname -I 2>/dev/null | awk '{print $1}')
+    printf '%s' "${h:-your-server-ip}"
+}
+panel_url() {
+    local scheme=http port; port=$(panel_get port)
+    [[ -n $(panel_get tls_cert) ]] && scheme=https
+    if [[ ($scheme == http && $port == 80) || ($scheme == https && $port == 443) ]]; then printf '%s://%s' "$scheme" "$(panel_host)"
+    else printf '%s://%s:%s' "$scheme" "$(panel_host)" "$port"; fi
+}
+
+# the list of servers the website shows (written for the panel user, nothing secret in it)
+panel_export_servers() {
+    [[ -d $PANEL_DIR/data ]] || return 0
+    local tmp="$PANEL_DIR/data/servers-public.json.tmp"
+    jq '[.[] | {id:.id, name:.name, port:.port, maxplayers:.maxplayers, map:.map}]' "$DB" >"$tmp" 2>/dev/null \
+        && chown "$CS2_USER:$CS2_GROUP" "$tmp" && chmod 644 "$tmp" && mv -f -- "$tmp" "$PANEL_DIR/data/servers-public.json"
+    return 0
+}
+
+# per-server NexusLink config (server id + panel address + key). Uses the loaded server (S_*).
+panel_write_plugin_config_current() {   # [disabled]
+    panel_installed || return 0
+    local base="$S_PATH/$CSGOREL" dir f key ip en=true
+    [[ ${1:-} == disabled ]] && en=false
+    [[ -d $base && ! -L $base ]] || return 0
+    dir="$base/addons/counterstrikesharp/configs/plugins/NexusLink"
+    ensure_chain "$base" "$dir" || return 0
+    f="$dir/NexusLink.json"; key=$(panel_get api_key); ip=$(panel_get internal_port)
+    local new
+    new=$(jq -n --argjson en "$en" --arg url "http://127.0.0.1:${ip:-27500}" --arg key "$key" --argjson id "$S_ID" \
+        '{ConfigVersion:1, Enabled:$en, PanelUrl:$url, ApiKey:$key, ServerId:$id, SnapshotSeconds:5, CodeCooldownSeconds:15, MinMatchRounds:3, ChatPrefix:"[Nexus]"}')
+    if [[ -f $f && $(jq -S . "$f" 2>/dev/null) == "$(jq -S . <<<"$new")" ]]; then return 0; fi
+    printf '%s\n' "$new" >"$f" && chown "$CS2_USER:$CS2_GROUP" "$f" && chmod 640 "$f"
+    PANEL_CFG_CHANGED=1
+    return 0
+}
+PANEL_CFG_CHANGED=0
+panel_write_all_plugin_configs() {   # [disabled]
+    local id; PANEL_CFG_CHANGED=0
+    while IFS= read -r id; do load_server "$id" && panel_write_plugin_config_current "${1:-}"; done < <(jq -r '.[].id' "$DB")
+}
+
+panel_payload_extract() {   # <dest>
+    awk '/^#__NEXUS_PAYLOAD_END__$/{f=0} f{sub(/^#/,""); print} /^#__NEXUS_PAYLOAD_BEGIN__$/{f=1}' "$SELF" | base64 -d 2>/dev/null | tar -xz -C "$1" 2>/dev/null
+}
+
+panel_unit_write() {
+    command -v systemctl >/dev/null 2>&1 || { err "systemd is not available on this machine."; return 1; }
+    cat >"/etc/systemd/system/$PANEL_UNIT.service" <<EOF
+[Unit]
+Description=CS2Nexus web panel
+After=network.target
+
+[Service]
+User=$CS2_USER
+Group=$CS2_GROUP
+Environment=NEXUS_PANEL_DATA=$PANEL_DIR/data
+ExecStartPre=-+$SELF panel-export
+ExecStart=/usr/bin/env python3 $PANEL_DIR/app/server.py
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=$PANEL_DIR/data
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+panel_firewall_hint() {   # <port>
+    command -v ufw >/dev/null 2>&1 || return 0
+    ufw status 2>/dev/null | grep -q "^Status: active" || return 0
+    ufw status 2>/dev/null | grep -qE "^$1(/tcp)?[[:space:]]+ALLOW" && return 0
+    if confirm_yn "The firewall (ufw) is active. Open port $1/tcp for the panel? [Y/n]: " y; then ufw allow "$1/tcp" >/dev/null && ok "Port $1/tcp opened."; fi
+}
+
+panel_install() {
+    local tmp key first=0
+    [[ -d $SHARED_ADDONS ]] || { err "The shared plugin folder does not exist yet (finish the launcher setup first)."; return 1; }
+    if ! command -v python3 >/dev/null 2>&1; then
+        confirm_yn "Python 3 is needed for the panel. Install it now (apt)? [Y/n]: " y || return 1
+        apt-get install -y python3 >/dev/null 2>&1 || { err "Could not install python3."; return 1; }
+    fi
+    python3 -c 'import sys,sqlite3; sys.exit(0 if sys.version_info >= (3,8) else 1)' 2>/dev/null || { err "Python 3.8 or newer with sqlite3 is required."; return 1; }
+    tmp=$(mktemp -d /tmp/cs2nexus-panel.XXXXXX) || return 1
+    if ! panel_payload_extract "$tmp" || [[ ! -f $tmp/app/server.py || ! -f $tmp/plugin/NexusLink/NexusLink.dll ]]; then
+        err "This launcher file has no panel inside (damaged copy?). Use 'Maintenance -> Update launcher'."
+        rm -rf --one-file-system -- "$tmp"; return 1
+    fi
+    panel_installed || first=1
+    install -d -m 755 -- "$PANEL_DIR" "$PANEL_DIR/maps" "$PANEL_DIR/tls"
+    install -d -m 750 -o "$CS2_USER" -g "$CS2_GROUP" -- "$PANEL_DIR/data"
+    chown -R "$CS2_USER:$CS2_GROUP" "$PANEL_DIR/maps" "$PANEL_DIR/tls"
+    rm -rf --one-file-system -- "$PANEL_DIR/app"
+    mv -- "$tmp/app" "$PANEL_DIR/app" && chown -R root:root "$PANEL_DIR/app" && chmod -R go-w "$PANEL_DIR/app"
+    printf '%s\n' "$PANEL_VERSION" >"$PANEL_DIR/VERSION"
+    if [[ ! -f $PANEL_SETTINGS ]]; then
+        key=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)
+        jq -n --arg key "$key" --arg dir "$PANEL_DIR" \
+            '{port:8080, bind:"0.0.0.0", internal_port:27500, api_key:$key, domain:"", tls_cert:"", tls_key:"", trust_proxy:false,
+              servers_file:($dir+"/data/servers-public.json"), maps_dir:($dir+"/maps"), title:"CS2Nexus", session_hours:720, code_ttl:600}' >"$PANEL_SETTINGS"
+        chown "root:$CS2_GROUP" "$PANEL_SETTINGS"; chmod 640 "$PANEL_SETTINGS"
+    fi
+    # NexusLink plugin: one shared copy for every server
+    local pdst="$SHARED_ADDONS/counterstrikesharp/plugins/NexusLink"
+    install -d -m 755 -o "$CS2_USER" -g "$CS2_GROUP" -- "$SHARED_ADDONS/counterstrikesharp/plugins"
+    rm -rf --one-file-system -- "$pdst"; cp -a -- "$tmp/plugin/NexusLink" "$pdst" && chown -R "$CS2_USER:$CS2_GROUP" "$pdst"
+    rm -rf --one-file-system -- "$tmp"
+    shared_update --arg n NexusLink --arg p "counterstrikesharp/plugins/NexusLink" \
+        'if any(.[]; type=="object" and .path == $p) then . else . += [{name:$n, path:$p}] end' >/dev/null
+    panel_export_servers
+    panel_unit_write || return 1
+    lock_ops 30 && { DRY_RUN=0; sync_shared_all || true; unlock_ops; }
+    panel_write_all_plugin_configs
+    systemctl enable "$PANEL_UNIT.service" >/dev/null 2>&1
+    systemctl restart "$PANEL_UNIT.service"; sleep 1
+    if panel_running; then ok "Web panel installed and running: $(panel_url)"; else err "The panel did not start. See: journalctl -u $PANEL_UNIT -n 30"; fi
+    panel_firewall_hint "$(panel_get port)"
+    ok "NexusLink plugin installed for every server (one shared copy)."
+    if ((first || PANEL_CFG_CHANGED)); then
+        warn "Restart your servers once (Restart Server) so they load NexusLink and connect to the panel."
+    fi
+}
+
+panel_ctl() {   # start|stop|restart
+    panel_installed || { err "The panel is not installed yet."; return 1; }
+    systemctl "$1" "$PANEL_UNIT.service" && sleep 1
+    if [[ $1 != stop ]]; then panel_running && ok "Panel is running: $(panel_url)" || err "The panel is not running. See the log (option 9)."
+    else ok "Panel stopped."; fi
+}
+
+panel_set_port() {
+    ask_num "Public port of the website (80 and 443 work too)" "$(panel_get port)" 1 65535 || return
+    local p=$ANSWER
+    [[ $p == "$(panel_get internal_port)" ]] && { err "That port is used by the internal plugin link."; return; }
+    panel_set port "$p" && ok "Port set to $p." && panel_firewall_hint "$p"
+    panel_running && systemctl restart "$PANEL_UNIT.service" && ok "Panel restarted: $(panel_url)"
+}
+
+panel_domain_menu() {
+    local c d email tmpd crt key host
+    while :; do
+        clear_screen; dsep
+        printf '%s              DOMAIN AND SSL%s\n' "$BOLD" "$RESET"; dsep; echo
+        d=$(panel_get domain)
+        printf '  Domain    : %s\n  SSL       : %s\n  Address   : %s\n  Proxy     : %s\n\n' "${d:-none (using the server IP)}" \
+            "$([[ -n $(panel_get tls_cert) ]] && echo "ON ($(panel_get tls_cert))" || echo OFF)" "$(panel_url)" \
+            "$([[ $(panel_get trust_proxy) == true ]] && echo 'trusting X-Forwarded headers' || echo 'direct')"
+        echo "  1) Set the domain name"
+        echo "  2) Get a free SSL certificate (Let's Encrypt)"
+        echo "  3) Use my own certificate files"
+        echo "  4) Turn SSL off"
+        echo "  5) I use a reverse proxy / Cloudflare in front (trust forwarded IP) ON / OFF"
+        echo "  6) Back"
+        echo
+        read -r -p "Select: " c || exit 0
+        case "$(trim "$c")" in
+            1) read -r -p "Domain (example: play.example.com, empty = remove): " d || exit 0; d=$(trim "${d,,}")
+               if [[ -z $d || $d =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$ ]]; then panel_set domain "\"$d\"" && ok "Saved."
+                   [[ -n $d ]] && info "Point the DNS A record of $d to this server's IP, then choose option 2 for SSL."
+               else err "That is not a valid domain name."; fi; pause ;;
+            2) d=$(panel_get domain)
+               [[ -n $d ]] || { err "Set the domain first (option 1)."; pause; continue; }
+               echo "  Needs: the domain already points to this server, and port 80 is free during the check."
+               if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '[:.]80$'; then err "Port 80 is in use by another program. Stop it first, then retry."; pause; continue; fi
+               read -r -p "Email for Let's Encrypt notices: " email || exit 0; email=$(trim "$email")
+               [[ $email =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { err "That email looks wrong."; pause; continue; }
+               if ! command -v certbot >/dev/null 2>&1; then
+                   confirm_yn "certbot is needed. Install it now (apt)? [Y/n]: " y || continue
+                   apt-get install -y certbot >/dev/null 2>&1 || { err "Could not install certbot."; pause; continue; }
+               fi
+               panel_firewall_hint 80
+               install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
+               cat >/etc/letsencrypt/renewal-hooks/deploy/cs2nexus-panel.sh <<EOF
+#!/bin/sh
+# copies the renewed certificate for the CS2Nexus panel and restarts it
+[ "\${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/$d" ] || exit 0
+cp -L /etc/letsencrypt/live/$d/fullchain.pem $PANEL_DIR/tls/fullchain.pem
+cp -L /etc/letsencrypt/live/$d/privkey.pem $PANEL_DIR/tls/privkey.pem
+chown $CS2_USER:$CS2_GROUP $PANEL_DIR/tls/fullchain.pem $PANEL_DIR/tls/privkey.pem
+chmod 640 $PANEL_DIR/tls/privkey.pem
+systemctl restart $PANEL_UNIT.service
+EOF
+               chmod 755 /etc/letsencrypt/renewal-hooks/deploy/cs2nexus-panel.sh
+               if certbot certonly --standalone -d "$d" --non-interactive --agree-tos -m "$email" --keep-until-expiring; then
+                   RENEWED_LINEAGE="/etc/letsencrypt/live/$d" /etc/letsencrypt/renewal-hooks/deploy/cs2nexus-panel.sh 2>/dev/null
+                   cp -L "/etc/letsencrypt/live/$d/fullchain.pem" "$PANEL_DIR/tls/fullchain.pem" && cp -L "/etc/letsencrypt/live/$d/privkey.pem" "$PANEL_DIR/tls/privkey.pem" \
+                       && chown "$CS2_USER:$CS2_GROUP" "$PANEL_DIR/tls/"*.pem && chmod 640 "$PANEL_DIR/tls/privkey.pem"
+                   panel_set tls_cert "\"$PANEL_DIR/tls/fullchain.pem\""; panel_set tls_key "\"$PANEL_DIR/tls/privkey.pem\""
+                   ok "Certificate installed. It renews itself (certbot timer) and the panel restarts after each renewal."
+                   if [[ $(panel_get port) != 443 ]] && confirm_yn "Use the normal HTTPS port 443 for the website? [Y/n]: " y; then panel_set port 443; panel_firewall_hint 443; fi
+                   panel_running && systemctl restart "$PANEL_UNIT.service"
+                   ok "Open: $(panel_url)"
+               else err "Let's Encrypt refused. Check that $d points to this server and port 80 is reachable from outside."; fi
+               pause ;;
+            3) read -r -p "Path of the certificate file (fullchain / .crt): " crt || exit 0; read -r -p "Path of the private key file: " key || exit 0
+               crt=$(trim "$crt"); key=$(trim "$key")
+               if [[ -f $crt && -f $key ]] && openssl x509 -in "$crt" -noout 2>/dev/null; then
+                   cp -L -- "$crt" "$PANEL_DIR/tls/fullchain.pem" && cp -L -- "$key" "$PANEL_DIR/tls/privkey.pem" \
+                       && chown "$CS2_USER:$CS2_GROUP" "$PANEL_DIR/tls/"*.pem && chmod 640 "$PANEL_DIR/tls/privkey.pem"
+                   panel_set tls_cert "\"$PANEL_DIR/tls/fullchain.pem\""; panel_set tls_key "\"$PANEL_DIR/tls/privkey.pem\""
+                   ok "Certificate copied. Renew it yourself by repeating this option."
+                   panel_running && systemctl restart "$PANEL_UNIT.service"
+               else err "Could not read a valid certificate and key at those paths."; fi; pause ;;
+            4) panel_set tls_cert '""'; panel_set tls_key '""'; ok "SSL is off (plain http)."; panel_running && systemctl restart "$PANEL_UNIT.service"; pause ;;
+            5) if [[ $(panel_get trust_proxy) == true ]]; then panel_set trust_proxy false; ok "Direct connections only."
+               else panel_set trust_proxy true; ok "X-Forwarded-For / -Proto are trusted. Only turn this on if ALL traffic comes through your proxy."; fi
+               panel_running && systemctl restart "$PANEL_UNIT.service"; pause ;;
+            6|q|Q) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+panel_maps_help() {
+    local n; n=$(find "$PANEL_DIR/maps" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) 2>/dev/null | wc -l)
+    echo
+    echo "  Map pictures folder : $PANEL_DIR/maps   ($n picture(s) now)"
+    echo "  Name each file like the map: de_dust2.jpg, de_mirage.png, de_inferno.webp, cs_office.jpg ..."
+    echo "  (jpg, png or webp, about 640x360 looks best). Workshop maps use the last part of the name."
+    echo "  Maps without a picture show a coloured card with the map name. New files show up at once."
+}
+
+panel_menu() {
+    local c st
+    while :; do
+        clear_screen; dsep
+        printf '%s              WEB PANEL%s\n' "$BOLD" "$RESET"; dsep; echo
+        if panel_installed; then
+            panel_running && st="${GREEN}RUNNING${RESET}" || st="${RED}STOPPED${RESET}"
+            printf '  Status  : %s   (panel %s, built into this launcher: %s)\n' "$st" "$(cat "$PANEL_DIR/VERSION" 2>/dev/null || echo ?)" "$PANEL_VERSION"
+            printf '  Address : %s\n' "$(panel_url)"
+            printf '  Plugin  : NexusLink (one shared copy; each server reports to http://127.0.0.1:%s)\n\n' "$(panel_get internal_port)"
+        else
+            echo "  Not installed yet. Players log in with !getcode in the game, then see their servers,"
+            echo "  play time and matches on a website that runs on this machine."
+            echo
+        fi
+        echo "  1) Install / update the panel (also installs the NexusLink plugin on all servers)"
+        echo "  2) Start"
+        echo "  3) Stop"
+        echo "  4) Restart"
+        echo "  5) Change the port"
+        echo "  6) Domain and SSL"
+        echo "  7) Map pictures"
+        echo "  8) Re-write the plugin settings of all servers (after changing ports)"
+        echo "  9) Show the panel log"
+        echo " 10) Remove the panel (data and pictures are kept)"
+        echo " 11) Back"
+        echo
+        read -r -p "Select: " c || exit 0
+        case "$(trim "$c")" in
+            1) panel_install; pause ;;
+            2) panel_ctl start; pause ;;
+            3) panel_ctl stop; pause ;;
+            4) panel_ctl restart; pause ;;
+            5) panel_installed && panel_set_port || err "Install the panel first."; pause ;;
+            6) panel_installed && panel_domain_menu || { err "Install the panel first."; pause; } ;;
+            7) panel_maps_help; pause ;;
+            8) panel_installed && { panel_write_all_plugin_configs; ok "Done."; ((PANEL_CFG_CHANGED)) && warn "Restart the servers (or run 'css_plugins reload NexusLink' in their console)."; } || err "Install the panel first."; pause ;;
+            9) journalctl -u "$PANEL_UNIT" -n 40 --no-pager 2>/dev/null || err "No log available."; pause ;;
+            10) if confirm_yn "Stop and remove the panel program? Players' history in $PANEL_DIR/data stays. [y/N]: " n; then
+                    systemctl disable --now "$PANEL_UNIT.service" >/dev/null 2>&1
+                    rm -f -- "/etc/systemd/system/$PANEL_UNIT.service"; systemctl daemon-reload
+                    rm -rf --one-file-system -- "$PANEL_DIR/app"
+                    panel_write_all_plugin_configs disabled 2>/dev/null
+                    ok "Panel removed. NexusLink is switched off in every server's settings (remove it in Plugins if you like)."
+                fi; pause ;;
+            11|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -2841,6 +3564,7 @@ mon_fmt_mb() {   # <MB> -> 812M / 3.4G
 main_menu() {
     local choice
     while :; do
+        panel_installed && panel_export_servers
         clear_screen
         dsep
         printf '%s                CS2NEXUS%s\n' "$BOLD" "$RESET"
@@ -2862,7 +3586,8 @@ main_menu() {
         echo "13) Maintenance"
         echo "14) Admins"
         echo "15) Resource Monitor (CPU / RAM / disk, live)"
-        echo "16) Exit"
+        echo "16) Web Panel (players' website)"
+        echo "17) Exit"
         echo
         read -r -p "Select: " choice || exit 0
         case "$(trim "$choice")" in
@@ -2881,7 +3606,8 @@ main_menu() {
             13) maintenance_menu ;;
             14) admins_menu ;;
             15) monitor_ui ;;
-            16) clear_screen; echo "Goodbye."; exit 0 ;;
+            16) panel_menu ;;
+            17) clear_screen; echo "Goodbye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -5319,6 +6045,9 @@ Usage: $SELF [command]
   broadcast MESSAGE...      send "say MESSAGE" to every running server
   watchdog                  start offline autostart servers (used by the timer)
   plugin-update             update plugins installed from the Plugin Browser (used by the timer)
+  backup                    make a data backup now (used by the timer)
+  panel-export              refresh the server list shown on the web panel (used by the panel service)
+  alert-check               check CPU / RAM / disk against the alert limits (used by the timer)
   --install                 install the 'nexus' command (also 'cs2')
   help                      this text
 
@@ -5442,6 +6171,9 @@ cli_main() {
         broadcast) preflight cli; cli_broadcast "$@" ;;
         watchdog)  preflight cli; watchdog_run ;;
         plugin-update) preflight cli; plugins_update_run 1 ;;
+        backup)    preflight cli; backup_run auto ;;
+        alert-check) preflight cli; alert_check ;;
+        panel-export) preflight cli; panel_export_servers ;;
         *) err "Unknown command: $subcmd"; usage >&2; return 2 ;;
     esac
 }
@@ -5503,3 +6235,436 @@ preflight menu
 [[ $SELF == /usr/local/bin/* ]] || install_command quiet || true
 ((POST_UPDATE)) && post_update_restart
 main_menu
+exit $?
+#__NEXUS_PAYLOAD_BEGIN__
+#H4sIAAAAAAAAA+w8a3PcNpL57F8BpZyQ3MxQM5L8iHSyy4/snfdiO7Xy7qZOq5UxJGZIiyS4JEYjRZr/ft0NgAQ5HMnZdbbq6lZV
+#8ZBAo9HobvQLYMLdr37zvwn8PZlM6Hey+UvP00d7j6ePn+w/OdiD9idPpgdfsUe/PWlffbWsFa8Y+6qSUt0Fd1///9G/cJeX5W+s
+#AyT/R48+X/7TyaPJ43/L/1/xp+UPPFBp9Fupwa+X//TJk0f/lv+/4q8jf3gMP9VffA4U8OODgy3yP3iyt/e4J//9KTSxyRenZODv
+#/7n8fT9gx8/YzQNvWQtWqyqNlHf0IJJFrRjoAztmsYyWuShUuBDqh0zg48vrN7HvQbcXWNiHaQyw+M+zrSPSGMAzodgHAL1Zj1jG
+#iwU8eqLwRiwX8FgsswweeVm/uORpZuBUmouqhpfTMzvff797/5d32M1icR6DFPcOmfcaftmbN4AMGvO04gsBrW/pQTemxVxUhYTW
+#N/pJNxfLC4R8Bz+6QV6KquR1DY3vzaPu4EWUwnqg/YV+8kYPmO5YztKa2vFBQ8NQlS5wuj/rJ92sKp4W0PgBf3VTxKMESXiFv7rp
+#07Li0PIH+NENCwDPoOU/8Vc3xXKh5ApxvdZPRE5Un8v5PI0Q4Xt6AGhoTBXPrnHt+AtNvDqf8cVCs+mlftLNdQL6jqs5oQfdWEqZ
+#ncccMfwEj+w1v/bY+ujBg91dNv4n/1gishKE/GC+LCKVyoKJzFd8MWJlJct6xMIwvEjjOgBdhQWSDhSudkaV4EoYdcORoGuMzWXF
+#fA19ejFil2dMztn72ScRqRDgqlTUPk3Abm9B1QKNnrF0zvxLdqwVEvvw5ZjNeVaLAKdXabEURw3sBXV7UYaKErAipKd3nJT6UsMJ
+#GOsCK3GlCBYfXgFKIGgIOkQTpeq/pCrxPVl4AY7hcfzDJQz4Ma1hnKgQLANB+3sBLDMYnrFW15mgKWuhXihY/myphG/ae+N6QMg9
+#wqKqpWDPmeexQzNg3WV0hDxGWYXzjCsfyEUSIrZjuPnttwxfGm7CYspSFLEfhYWMxYfrEvFHgL4n3A/Ap3cA4Z8AUcXCj4KA5q+E
+#WlYFK44erI11QD76F+IaaOZVbUwcY2h70Ix8OIW+M/b8OYNfxEDiJsjPURiCDAhTHVaizHgkXmSZ79147Dt2Af9564abhrgaiLO2
+#K8oE+Jxj1F+gi62SNBPML8J5WtXqFbzFyJRK5GCF6LXbd8QaTHxWvwbGAC5VI7JCrNibQmUhtn4Aq/l7WeUgAzS0I7SV0HyCwoYt
+#nIs4Xeaetq62EfZ9pWBTB+Fcj0SMiMyHCX7HpuCwkefNJuULCT3upkSuvOUqCXN+5U9G+nmeSVn5iAdEvAKfs0uo2Bjo1jJECdTs
+#P9jjSWBZpnwPScMRXgdm//FkEyonS3rDwBY6U9YwE6JcdxA8fXwwgCGRy2oLCj3j2hWoHQX2cMsgMwuOWrcci5fQKyKXZbllmRkr
+#Ik31iCXdnly326XksJSpuwzAHWYCLZAFSYZAHFbl3UXl7BuYAHafgUSWWOgE/PKhhVgHsD0dIA1h1mqsMyjQW44RRI6qafZsjsbU
+#84JQyR/lSlSveC38wO4if/evf90FTfV2AaIusxSmwMdSli7Q6d/4+JfJ+Pvz8RlBe65KlrAWdQ0z+3nfWRiSoMPyZ6domON5tpFi
+#i9PirOmyDa6xaan5mx+L26i+5dVtnN8uFrfz61ue5rf1sprfXvxyO0tkGZzvEp1mUbunSDpssjRTYLtfgjcVvAhgz5T+Crm1Op2c
+#AYv+BIbRsAisysqY+GkQhJ9kWvge87rKBeNfVMqHnxEDY1nxrRzgJfEALSIq2eSoY8ETtHrAGuwCHfod25/C/FESRgmvXoEJfqF8
+#MATs2bNnMBTwIGACqgEb5aiZELwWNIMf9+L0kjSEvCKYGexBW+kTkUYlRqzWVujjjEcXi0oui/gwSwswlmMIfWKMtvzp/qNYLEZJ
+#nfkPb5I12z+ASSffBKYFiP2OHTwKNClrdjD5hk2ffhMEH9l6ZHzbIDnjMkFTCPQcuhoEbAKlDto1zdFWH7cRqtEKVBvssvGDBk7z
+#hWEAPNGMdRXBfLs4fBcZIIoIuPmnP755JfNSFrhCQgPxVoZBJgzKJCy9WMBLxn/BgMs4aUC5GQV4oqok7kYd1yOM9iN+YIbBWq2/
+#hV6n8e9LUV2fiAw8HZgaLzRMAZVFqYRxCqrLrzFcL4BQ7/OJuPmV6L0js8Z1u90AGhWd19dFxFrvU6Z+CeZxxGTZ9UISEBmvDSJO
+#F4UP0q5EDGSmEHWgp4PYbCyrdAHmDXSDMJgg0ApUhjMZX1OoAqoo5qCKsRWwDHOhEolJj/fT+5MPQLQME8FjnajcQCSvI7oxxjMe
+#KlkJWz/iSPjup1qiUfV+Hr/7GfumGEczM98x+8PJ+3dhTQYznV8bOhqW6BViAMFXPAWVFCpKLB+aXQ2unpuE6ghitmvt/XkzqgqR
+#CB+jCQZUwZb3z2FxDs9BWxVXS2BWFeqnkUax7ticSJbXGJn5uHk0e5B5Bb9MFxxkDaFwWs4kr2KM/FZpEctVmNYnIlpWgpiEw6xZ
+#3RwVrqpUx356hnYv0mpwd2E7hxBRbzETypSyTpHAw3l6JeIjWfIoVdeHE9pBMDa85NmSQicYfdTGmshru0MU16A16a1PcxteWnBx
+#JSLYvDkHcA954RFLQVl4liEkDLdb8MhV6Z8qmae1gM5aZtTrcrVWsvxAaS9sohuTAWNQ9gMkiD5FkBDoiQoWgSQ6CTJzsAhIQK/9
+#HAQ3Lxw05bJOIMxQFoOtAmiX2CwtSWPYMBATazUB/4/Bmosfoj+td8YZtuLPpFb1EPsLzINwG+ELeBUwFLK6PjWDMJkwjyegZgIT
+#Cw9J1G9nvi4KoC2k8eSFJeYkxLIvkn1igLyE7LdvYdD4/sgx1wAzrVdH8neMfH8jeraclk6fFtuMvEYHiQLtQs+adGR/FcqLgKmk
+#kivtWxnVS/q71tROEBEZBncTN8iwlxiPJZZmkzWLolZrVhqx2weTS4dmJvw5ugsuTpEVH8JzfECXnqnK64zo+ADKmE7RoIyRU2de
+#0Ki3SYz6mTFkIyHCg+aGOCQ4MgFnT2jQvyxxgT+l0QX4o2G5ZaCFDV/97RK0qlEbUQVWBA4u5HPduhzIKmsf8XeAwIgAyMMU7ATi
+#dIVO4yF0LxYKI/Y9Kyo7HHubvY/MAVzWRqEBBOeVSh2mk1U7ZJENZpCM0+hsxLQNEzH0UR5PYl0HNi5AjHrDM5OZt+2bHh7iwELX
+#ioj11n7grs9OQLjALywfvFEi973i6pwWTDRoswui0xxvdNHtsrvbxgFdB/WFtrx21k7ewNNC/Rc1Go3RopIQIbxUIPiWPTs7OXGH
+#AFaJ7PTpLsrPYItbECwFYdbTUWhMbtE0Uvz7xWxZDTZdVMDEVc0w88fokcEP+7qQEBlB2GRAvg4cf0Mtf4TkvBNHQRLf5POQcNSY
+#1SO5kNjv77muGHZavSXYpz6MdniV8rFmFAY9WEiy4SwlHxi2pDoZSWEXwFTw8N13gcbu6nvqToCw4NMgekQfCM5kTh7E6wbudRqL
+#LQTW1eUYu727coQI0hHVpAh1KAtMTXSqrJlnSQh1EcVk2A1lWNa+wnfDQu+5p9NoonSkF9mWKSDnrVQ3nYhyDDc/wksBO5k9vGmc
+#bCJrhZq0Pnx4o0euP7qmZ2ZWPlsqZexEu64SCxgKolR4awD0Mtu1mUm9oMk/ZkNmASLciybwbyJDIBxUPxFFE2jMNkx7O1GZihiD
+#KLAfGAGBLfisYYY+ClSmjyYTMh/WuIF0rf7M+rkFMgbyizSiGmhHLSgzMEk1Cg7Sai9awizb9QSVKecmqdgGgLJydImMwNog3Y62
+#Xs4arHXJu3KMpaKM2tFMDza73gqBg511x2/os9+mv7TkAJW1ZbSGwyK0qx5yPtfN5FFGDdO7QS2Z2BMaUfszeTUi72TsDYa02NjW
+#ZrDTOEUMXqHPtQFlZ/k5eIzY1Vtj+EKRl+pa03VkvSpJn7Bbp0rVU2cC1xwGQzEG+i1gkYnOKSVwT61MPIEJqrcL/1LGj7EDxi/I
+#VZNr9rMv9uXiWVx9n+oK1iaqH3Wn7zIe1u0YS+DENluppWftNh4ZOzKpRWQDEaOnybQ3nADGKlWZGBKX7iB9ZZtSBlIHhUzt7SBL
+#tE0FE5EuEnU4fVxeaVuLauYstxJzyMKwhtUJZwaD/FaklhVBSBI0RgqTFSeyqzDprUjswYD+657QoEKdOD3T9om424RIWtVs0GTo
+#xQad4WExfTKy7V8wLcLg50FffbDRh1gitQnfkAqJqjIq1BUhtMN7JUkwPBP6uKEdlxbl0pYN6bnnrWIxpoJ0GpvX1nnRgRq5WW00
+#oOl7DFGXSkaQeUF4gVBgqmwjSFHxLP0Fm7GyySE+rjBUqUuRZVEiogvooWC4iV8gFI+qdCbi2bVnKNBLogQ2kRlwCNp/hr8x/mNX
+#B0AhnZE3Q5ztportDho74b9xWaU5rxxfDe4gT1VnO6BkQtPeHHogEwd8tWWuq+wYgV3iOT6NoXC8W4V2a/Avxv8zGX9vK/CmNg1a
+#+NSqf4sEjzVtevOMHYCXuWzhDygRHqP3sq0H6F3oINRVDTySMnzCxw6X5qnI4sY7ZnwmMuoHQEdPuoyiVm01iNYRCmmEzLYxaT7A
+#t4bt2laIy5Z94jIE54ngr8WcLzO1mSX2mLuVnd3c0PIOU/mn6HFQmzZCIb0qKr5at9d1eQzXhqVWPssE6iKG4EfUuAXZbFkTls35
+#PFMBbtPqu2wlbLdkl1CSVLDGdojSQ46sm5DSmEyyia3dpHrITdf0vaX0cCEBvY6kKp04dhbLBsjexE78skGOy8JCqJWsLqwsOo76
+#fgG0o4dZr1Psu3hv93G7DbZ729ZDSlPQpjm1kYbttmmHdVezKQwkJSRUb2sCXOPBe3vH8dMNpMy6vl6Jsm5I0SBZ6sQGvRi0XTgM
+#nOqQ7R8au/dPjN3vhLBoAvQY3uVyWmCak4A24nHOpmnBEyyDqbXBcxkt6y9YtIx5nVCJfDPMazaJk8sP7UsqSgyGL07woov/VDTa
+#m0zareNsImAdx+NWfYtLNx41x85kZdZbkR5MpkF7/cs5ZDVlKGBXm0JQMo2BeanX5iRx/Vi1rOSKcqIyzHU+lIsmH2rVdiOVKtsE
+#uNS5mYvDR5Qg6FyE13LpkfMK+mnWMN5PdNtCYehjbm4AWjzJFXHgqBBg1o00egV58yFdtGhgcZvePdNFs4KPD2/K8CLNsnrNdhm+
+#xIKrpF5/1Omxk56hDF/KKz/KakPniDXFizqSlXDVKTGuONm/Y2shkiYs7+eciLG5FfTc3hAwEx3ad1tVsYlgp6qzPVHBxdAZM6wG
+#wwJ9bmCR2byv7OV9rnp1LhcBzGYq+w7gKIw38ftQJtueR4JYdfLcJLiyW98Byk1V0OA7nZy58QNErlsWizGtjX2Sva5toxs06n2h
+#845OKeC+NJoIem6Q4MtPyB6tlppEDUObZORoKjXiP+fEUK2xDTWYsxhMv4aajbWECcjAC9oyT6ewf1/22s3GcFAjRycPY652AJtN
+#yUJ3tUX69lw2wrllUws0NzxIz8qQlBJN3j7u98+CxPt8UiWiug8YY8M9tK3O+76jgttvYxRyNeaUhzXFLkmVny0FrIRTrfSOIhhi
+#TIu57Hn/IbALXTHUIpbhilf5smyUTr96qDwyTIvznEIw25sWb/Hda3XLVqfuqabhxJ0anPycGhyOwhrc5j0Rza5fOXyjcGxLxq2Y
+#tc0zlWPZqxzb4MJaQjxhHxYw9XXT7Cy9FKRRDVNBc3Ys/62Fitr6mz6Lt+fixlN4EeWfxHpsC7ECO4I9MNITPIcJyJ6fw7bQgWV7
+#3U/dh7yHm1CrTdSbmGm/3INcdpHTEM/utZGDsFd2HJAqbRzYQCM9Vc+rznmEFzAhIR3pwzkwM8vZvcELDmtryMqx6YSrrXXFxv22
+#uE28X+c8y1x/Cz1NfN8jkmzh72FKqktt92O59k+kMQKigg2/5nBLR9C4es1nfKz1RVZktI2AsAfbzmshCmwH/9Fts8F4H5XOdQL8
+#dEA7G2qA1Tuo2/bWSDiE3IFDk9Ed73lbaeF6VbIxTo0pOnQ8uk3kN2mklfZIpItWgHRH4u4cxOJQaTFsJxKvf5i1ooXBV8CBN1Kd
+#lmEitqE0mkBYQyUVdyI507BtVS2821sJ2NQm8gXOhau0AD3L8DGTdY1KF+NLXPFVbQ/QhrQZI4z7tNk53eRX/pS+MnDYjNcx6WSg
+#hiYYEpvLyg7ItgOEwXwkow8m7ojbi3zgVGgYVLWgdKW4ofBOxzzj1V5jVVK3SP5xlcYqOXx407Bjz1zepouY7QSQRSDf6DJ4EKy/
+#+djm2oOE5kLxXgxnmQfSrEFejeNrW1CwkFeNWJtsNbqPO62bGNUbsSb6xk6izYyimsvJb0/okl6qRA40np6BNoIrOdQZJ14GFMWb
+#2FRCmPk2B09nnHvGdJP3JehU55oxqDSaxNbrfde8KHs1L1IrrPNIjK0dyF1qIr6CUj+aNH4SWnH7t5DOmwoMuuaM/unTkaPSe+iN
+#V51UZjCmw8Xcef5NEGPQn0Z9Zt1+CgWsMs0zcQW6BFOv2ZRNPlr5N5bBrqU9tOmhG8A2pS8G7sOpgq5CDi9knvHF5mGqRpg7cbqx
+#Tqg8IZ0i59aom2P7QZ2vGoV3cO3dg6tnxCpRLzNF5+cVVlaM9Cr9Kc8Kq3wOPnxHTKYbTWWnnxocADSfHQBqsKZak1iKSOFdTK97
+#6S+GDZ1mH7CQ6ccjqhqMWFsz6JSc8A7KMYvvS3KoetSkxTiqid7sxVBTGTK1B8FtrKsqp/ygkl7uSwuJZGYIMNV+sPKnHmYdXkzn
+#OvREN7S9/BJTUI9UyTsjD3CBxN6Nnb772YzI6TIvrQbxlA2eylWWprIE/9oyEtWbMjFX5+C0smvsXaDX3Cxeqdihya1WdUe3VSut
+#DdC5WbkaQkiVo22dupK0rRcvXteq7vijPgKe84XYhgBksRW5Lh6tg22WbcvlC6VsTWg0WKLagEctH68qXjbGgpo6OqcPpfEdHy29
+#KH7TTNe3h+8RKLlYZOI1bSkf9pE+QMQD0lV7mfbtSag9Em2WPEzxGjpzWs01bx3jaBR0jW7V+9CPTjDFFZirmAor5myzd3Jyx31N
+#He+xUNuA/pXNovuxwZ14gLjTDjnHX2Od+OuNe6D9jxW3rYGmdHmCfPosJtBFtPbiPDrTk5Cc/iniaD7w2CG231VM3zVRBl37JTkN
+#FNdphmqwjN5eYjNdh0ayOD3M3qULLWtbV9+JsTbQMmCnUZW2TNVVEGjQj3cFrUbSqP09w7+Pl6EG8v9gA3IPmbyRzPcdHvGObox2
+#IipNYrey4VYy8J701sNzVLP2xLwB6OmAc8hvyvOtW6SV1K3RtZ9Yfd5tsNxWwYZ7AcdANSlvrl3R01bjlLvVpNwEyJ8H3WSfIV7p
+#iHvBNq2cwv4mNM/NuwmuzQ2vNgS+gwUXcTf+J+y68YZdIGpyMjavI58yYhxfWhdyZ1aTQ6ykvyfLQx02UZnMJpp6aieeslBN6RiN
+#xH23Ge+y1H0nNHSdkNZNqgAj7PDtV8vIjujTBUxNXqoC7/eAJWvdgn3FTU+ZjPkAZNMxDH02NGS3nmdpnqrjvcm3cj4H5MfIVIvd
+#hmTbzwt36N7/jrFd7aOtEnRMEZGzoHSpC2XsuJ6TPlWBeA0AA1oZMgOGwLutguhzyaMuUwauE/bX8auvFLaFr+6tQuQu0mPdVt6r
+#BbiGzRQQtESdW+NmZZSyDl7ae83xwtfW61aFXL1szsLciwHa1OkLMe0Zyqq5HmSu1mDtpUUQd0/yqbdbP0ZP5Q4YKHX0RhAXto+w
+#haTuGM2nuy9HIdCAjR8SG4Hid9XE90P9/zLYWNaJ+F/2rr27bRvZ37/9KVD69tRKRZminpbinHUSZ5ttkuYmbre97a4PJVEWa0lU
+#ScqOq+Pvfuc3AEjwIdlpsum5p3EfIgEQj5nBvAAMxmVA5lfX7tzPmDkslG6tAVbcyCERV69oTuNEf0zdMtwsH9Kz1GnHPdOI2b13
+#0tV7JxVOaqnCpBfNZHiWFJLwwWHDjdq6nS6Y6gHrNdOh6XxOxzw0nXgZ7FJI5A5cFPyiw/xZjqHcTHnfrZ7hZXbaythslO7H+gIu
+#0k3ugJ7aiaT3N6WbkbLdkok6FKsdXF8VdyOrhYtLXoZJvce79c1dG1DLm08zNOU3nebbV5tUD3ZsQt0pSz5Sn7BUn/VDs8u7RLQp
+#OTOqTsWnjDdSKw5qa3mJxz2hNtl2/jN7bPmwU1Ri+vIIFFNmjtQ0ZFLqzmYcDukVj12aZ5Hk+c6VPBDIW3/0UcyGef7SOG8pS6Ub
+#eUxJlBkeK+lRUuRfyxeW5J8KYd34fZr+ytSqCjvXGfqpfbmdLrLdmWoRHIz9qpF40YWfNMbzkOYjzU3vZ2zl+vexdQj7U3eWLbMv
+#qDhc2N/6N/p1nERz4zWeBdNEvXuqajnM89HcW15+xQU9RMMyrFA0yKffs9g+6tghzlZsKveSgs1U18PogCBT56vLEFmFq5jP09Yl
+#bVFZfTZNnm67a3IZh8L0MUb69qW/XINCFiZDVs9DkW9htxmu3Ljp12wd0n/3x7JkzxXo3eczeoBqvttZn+UWtffpbuY6kftX9WFB
+#gu1d8CxKnm2bZUO1+V3tlkU7Oa6qzOBs59wdw2MhlconBu7eQYHvjMIwUWyncEAzd7bzoni2k83V9Dxx6QRuxnMLMjU7yF3L/v9n
+#R8X76/zl4j/KSBzj+COHgNwd/9Ftd8vxH7vd5uf4j5/ib4BxYbLbtgq4s9/su013MqSUyAtinxKm7qh1lCa4g3231+q2PaRASR3s
+#t9rtdscbcjVsZ+z7R74/baMEW9GD/aOe1x1xJZNgMdjvTvvOUU9+MU7w7vWnzpDfbCruem2v18I7Kmt53daYX5DXHbUnzbb8lsTd
+#YL/XHveOutydkGyffb/f63an3FbkXQ/2PW/UHXflB7wHe7A/nU5aPU8nLZOB9dibLePxLCJZbtWtp89fiRMsVS1JZNL7m3AUJqF4
+#EhL3X8b+hJLe+hehL75/Ln6AaBjNfQHfkpFh1eMbYv0Lex3UbUR/8W2ZUI+9ZWyTqhtMocc82IzCd3Yc/I4oP6MwIj3HppTbvVmy
+#mG+MWEhXZPVrPNVu9yAWNgsSdQQDZ7gIlra21Rznajbc9uFwHM7DSKXJiCoMgbbjCJyQO2w2OkLmIr02tK/90SWWTOnNjhdEMDP0
+#1ONQOoFH0Ljd+1mKmn9tVByfAXxvXwQLHEWmgrd73kY2GyxnNG5KmDXrM7c+a9VX9cm8PpnUw3l9Pc/GsyL5iWac270BI82+CuKA
+#wLwhicFkRxapiMN5MEl7S6VqQ5VtSw8WSg0VUBFDipDfWr2D6v5ARQAQDw73GiMvSruO1eYhjexiacv9AWMfcVKGvxKvCKY39lge
+#1RjEK1Jb7ZGfXPuk61x4Kz5gmHa82ab+8Ro8pdZJdo4PcE7v6lrYoum0ndW72qFLSk6K8SQJF4NmYVBsBZZxyTORaKAxikghubPr
+#3DlqcQh82xNssWEzgdE0lIjFMbhmw+1E/kKmXEtq6jmOKpFECI8xGOtJMCTrn2q3AQiMuOE0/YXuk4ivLjZyT4kLsCja5GeTAscJ
+#D8Mj9KDA/YbiAoUcmKQ8PySTqiJzCeltIM7RiIlIehZ9eudZktJvY5Qs084GbK3bI9KRLu9o5v7d1e0fUUXNfomMu4Uu5ZDWJaRV
+#4nq8jmJqZxUGgKYcxmCGcLcmJPfdadvpHMlsffKwDOpxClS7gFI1nH1nSuKkla+norn+aDSedmWxn/UhqX9tdMymRlf3eyJtISA/
+#WF6adfDoFOidHDRZAtXysMqDIYfqMuAQ/CviDY6ck75qFtOS1EgdUkMr4ZKySSvfpCGpIn9OVV/5Mt0GKd1rKAa73ob1HSMjhjS8
+#z/Tq83jQMXgQiCW/s+VEbrWvrocY4XQeXg+UkccwSRP9+TxYxUE8vJ5RvcwafBoQVtCzwQ4G3jRhOElOallD2UAvYxS9lOAH5ixS
+#yFRUJ79yBESBK3FHvCfGsS3SbNij0Ea8wJrgdAK6/9OBTSUVRmwyLNcZWrwRNUUNDJkVEeyTcDVgzk2M+0vxtSAo7pjC78Ff+gX+
+#AmHBIlyOqOmCWf9ukzHvvxt0pLhaYasEhBUeDKxIYTLUkpOPNqeVu33Ujia6JvovomDCuG51Gdk5b/HGFAgfJA+cDn0sO5YKuLac
+#LSR7NxWzNBtWpzueUUFOryhJWfLM4iYVuK4GpII1drlgcuawkWyVpuWZJuGOJVgcngDo6bc8i0tTIsdJ2y233RvyFjZM7FuuBIET
+#U+khxYZGpvPlMNPjvhyGHFLKngYJAfqKWbYMnVhBtsES7MjZPsmRYPvLSUoeTB2OkiT3wLBJGQ6ThgRadDHyDtxOp67/a3Q6Ncka
+#cFyEQEPKJSao4JJOHf+QsgE0jtfJBtH+bPgsiXHNby7C5YEjnDrPOqeezUCb8VvDFskv6w7/KCSZQY+AKOVI3pQIHqMFwUdXhTz6
+#H2F9sQKTgDhbL5bxoNlioppGclZt00cgi7dRVarIshAnCDgVgrxIQYY23+vqDgsmP0Un6NiwVIRDz2wyRuLkMO2oQszWTVQ232eW
+#lzn7PWWCaj1ej+6l5fULmqIhx2W/G0cR65uTUEOln8GkrDB1aDaVkETWaC03OamyRrgs6zpkadb0AIKJnycebRrIMWCCYQASKxw4
+#6g+zVE6+goVJv8v1gmT+eJB4o/WcNGZ6j4esiWiOQe1xHKk8gNEZl0VEKjO6POnBDoDAAWOxaOBobqErFUEly+pkQG+6+Ymw32q1
+#251RARFNhouqsjGt1CsZcKsbA26NvsFv8srANtUpnXpFregPaHgSE1NvEcxvDCsAndyu9YEzyQMl4En8ZAjutim3XZiLYDLCKUtp
+#Vxk8XNWsmaOmo/tTE+gXh/IruCIQh5ONtlz3lbYCKBdow5aKQay/FvNgo7OC5Tji6I+DeHgPdtpyJDfN2jTnPq+FGK0MBiOfVDk/
+#1RNVqwdk5eca4wWkPANRlqfBENx7coR7aXPV8DaZkhzEKE8VpQ+pIEcuKWNEKuGcKU98VWlLZrMd2a6KkLMx1IltkkmNsOhH2WYP
+#bzFEevAb8agPSZDkPEdFfdB1iVR5hmVq+hrBZcZerKYe04NGYs6VogS3Gp/0CW22WJ/aRaR4uh/lZyfchLWcx6zRAfAwXdOgCgPB
+#VgB21vDspd/7aAxUq7z5oDONaiJ969Eb49W5Ax2mhVAQq6zy8lHdCh3UGI3blqBShUVeay1qi2ZBPtq7Q7HcFZi97yAwO6t3TdIB
+#2/UWaYHNWjGl363VVJPYG1nRGKvt7PCQZpjyfUjroVtlxLTT4eI08aYwGbUvYjydHPldVbCkAvXex84xRS4pT6pOKDbFtpiUMhOl
+#q305ZQ7cTrlh6mBU/JCPScxam+JsL3U3J/R3uyszrdQR3YwxKjBXsgTVk8Y4QWd2+n1MMS63+275pPBF9kGIDyqtPkT1uJfqrpR2
+#qbkXQCxlxYjYDkv9oquv2oBkprXyIh8Obe5Hg4joDgHCleTGLP3UqgbRWBGv/gCNWlXy6x3iod+X4kEVV5Nkp2JZZZ2nhkUbHNNk
+#2TxXqQHSmLaAZJcPxHV2TgxZr5i5uSnbfh/NB7ydd5cxM+en+1BR5K98LzkADcEGryuG3uxSX+tEYjXJ1dm0c2VPUbeYJHfJa4kP
+#WXiSG5dbHFd3l0anahB83LugoBc5oVlp26lyk5rWdCzDpUyk0wkb77apKUh7L+EIyGUTs618VJWTU1UvGsvF5n5AKXsp0jqSxT0I
+#v9BK+jEOz254YHI8g+ah3dTq5XYXgFsk/FalaM/aKNlZpj9oi7Ekv8ZGpXIP78UZpKeL98Kp0DwyogSuoVjJSaOyt/pUOP+ek7/C
+#6YEa7svbO+AXGTU1moay1TxyMDcbbU1ju303YDqGsmywNHDu7cZlbj0z75OvcPkUDFBDW+tLroGhl1dGyn41RzrNFszHDX8QIDIs
+#VMkKluEMQtrCW/1h1w++z5ScnQT1YV4inCspk5kcVXoQOe/jUENvtUtWXrvCv7Ztppr1i7vdVDu59gd5dQwScnJLA63MFMtW17I+
+#N+JxUr1QV+ndSU1uo4KK77d9Lp1D2YnqPMAMmuj1q303ua8FzlFv2BnXzGc0ok2FqoGTRVtpcSd0i5VVr1bhWNHmfTCam1IGyhrt
+#al0JDeDkdm4Q7GgUMg+Gatly1bnY3ZLLRUKaC261FTqGDlDhT+UzTpvc+pReRtpiuKgZh/WySofJ7R4fm815JVJrYO6tYn+gH+5G
+#H1U2K6kCFSMtYbnkTNRDbEu9HxUPOC6MPcZVi/VkYr5uCrKBimemXUeZDmU0JxEOeFPR7UyHiuB8NwpVzpEkKdGh6dfvq8XdCndQ
+#kpC9tilaZQLpyaZkemHr+0bPdFK/ppkNmh6E3mhear8bQLCS6vA33CXpiYPMtdmDf7mGjWW80lItxY+6yhuoxmJHqRP5Vn1pirgj
+#YxsJU1BpkUR+I/3zJS2oug+sH6APeRc+D7uK45t2s1xw1L2VfvddXJYKwYm01VzVJdjDY3qnjhzVButHu4FpmLuO6p4pTFzlSRO5
+#HWNOWvt9AQ4VQ4IUekvzsCWhz4LbBL1LoJeVg1mbu8OMJqWikvtM5RIDNpNbRpO4CEYT3iryp2Sv2JE/WY/9ib0I1Y4XW+b4y7Ev
+#qXGULOu8VaMu1xfYppcOqGx6SnNdECOP69mj2WCJ0oX0S+x2RdyKzFwv0afUK1u4AuDT7f/M7f+delcB0W0jvrr4mG3s3v/rOO1m
+#u7D/l1Lcz/t/P8XfQ8K1eLeYL+Nja5Ykq8Hh4fX1deO61Qiji0OXsHNIJSxxFfg4tXdsge+1XPrXevQwwi00PAuOLUoQkjXI54jK
+#di1clzk/tvabnttqOdbho4dY4xeTY+tlV7guaRSiO29i3+nvuixYgwWrM7z06Uu5MVgn2Ko1t9FJk6BfIC7uscVzF42Mg2g898WY
+#+tCkToxv6LdPfcKHWafktmKUxxgf/SVPHeTmP+82amDX8Udt447577bcZnH/f6/nfJ7/n+LvIW57xMlpAbQ/2nuIH74a7tjylxYS
+#fG9CP/AsCdyRgagA1jqZ2n1LJ2Mt5dgCi8B2b0so3efYkrN14pNYUVMXNy0E2Ddux2Nv7h83UQlvOnv05K37yn+3jh8eyve9hxDT
+#IvJprkIsWRxu/diqkFYWH/6mYogmhMn8NbE0K1cDL2vHM99PivWkp17wwaEaLvbWq8H7kTxTfWyReUxlhHjopSnY6ZxWaIlgotMe
+#MWetYJvCuAVNhbx5b644XkdYhHgC1aTMGrsfzBq1RZDyxoewzEV6V2M6yAxnKECFPYbPJLgyYCbVeoYc5clrCBlSIDNLF5QvWbCC
+#Y+uFunjRUsf10Rf+WNWUYSF/Q0qKD94uIZGib/GzzEEsvSu5pcJ69CK8IMpU/c+P4HoWyjr4QXVFhfl9KKMNGEWxvTUtzg1KfHvx
+#KlytVwrjohD5iM8SWgrMRmWYWWltuELQepSCWjad9iTfY97Ymn75kl80FPN9xhRJYSQPL1YBiXIklOghbfvhIbWqIKYf1YOcSX4E
+#HuEFS26ARE2K7hUjVqI7uCKaXoVkOvD4UJ4+wzU7qwQ3ZmdzFXETfo0ZCJyLdtRUPZQM7M9mqP/P/vLyH9edfvw2IOR7nc5W/R/P
+#efnvdjrt/xKdj9+V8t9fXP6X8e8v+X7bj9jGHfpfp3z+s+10P9t/n+QPPhELFzZbA2HNk8hChBkl3SlFy3eZnMlLypISM5cBGaFy
+#8JhlaUGOTP3Mublb/5CtrmPI5+KsQNYkWZykLHny7qhpFC5EMvPFBQJfJqGIfR+BgSNf3IRrXr+u4yniq8/5Flx+0wGB8g1xVCe0
+#9CpMl8A9qop0XrFeiRs/UR/k7sLEB9/Jp1ymvBKTc9Wjma1C/SF7s7wV4VRgZ+itvqGkqqy8WFZ9ccjFc8XUHaiMuHB1I/RFsWN5
+#PX2hLK5ZVUXxJAGR3e1UBjiDGFA3y/JdTSj7D9IzBXzYNBJAWIfkKRZ2UfgMFscXF37CSKQPgUKyLpKGIEjeMO6uSRVldHIeLkEr
+#VtVCVadwy6ZlBFDfEM8Tgcu3Yr5XmDTpRbBcJ36+MzwSHn9hRHztVpHEs+vQ+BtcDQiKaeSqhAcR2Y/pVxKjSc3F29nyve/b6Q2E
+#FaTdKNehLhhjcFIpUgr9OX25nk9wmZcY+WT4IFbkpCHOohvhXZBapaqRIcDw5Ru9xdHISO9XQYGfCBOYAsWroyuK83UsRVKgAcTp
+#vFM4nYXXmE48S0FbAa6f5tjiWf+y22Yk11CxufwJerGRnbgVG8QAvzVGlV0to6Yx74vguS8Dy1MF2TTmOEvZWPEh7so2WkjLyXsx
+#UOqf8klnqDtIkMMPoOZVFF5EfhynhWjsCphpkrzKCanySY0lzVdb7SSFys3WZ4x4BETMl+JC2zL5PgtmrTKcMw+QSGwWhjFfDM7B
+#l9NvjLsR8NEzPGAWLgslMjkA1Mi3QglPVsEFqkgnu5OA+w8cSRQXSihenULYjwsFJGaZL17f0sRf1sVmfkudwpU+m8mtwLposXts
+#UTONEKESSVRBIBvl2SyIBf3LwoPzCmMuioLcnNJ8ANSTk03GWIsx8bVgwKl3A6dmFHyW2YBugXQMgP1kCLtifsaFngXLICZOoUvm
+#pyif1WRONA2W3lywL6FRqg1rh0xn+FbGbM03rOOUMxjCpZmKZW3JcePETAfikP4Uv0Z6GppcYlDRl0HIRgRTDUj1ZuRfTjzOvMTN
+#aKAT+r93m2tfRn/lYaVboswCWWhxzUBSAk/zmUV/W0xlen1aTOUOnZTKLi64NEfLLmYurpgtvfzhdTGHd3Glfc/B259K6qFfwUHC
+#c9DVselTCkKKLIHpqoUH1jozOuechUQv4E2PuJzByJxRVTp3VsibeDc6a5JlTdZRocosHbXpvBkq3CwqSqTZWfLcl8TGp3xEM/tG
+#ylUEPGKghQufI12Ia1zMeR2FeJwFc59jIkH6izd+Et2YekAuyF8GPvkuONZuQyi1iiWyVq6W/rVScvb+tPU/tv+0sh5/NDPwrvU/
+#xy2u/3Xazc/xfz7J30bAzc+K6MWcZID1SVefP//92X9q/isz8+Y/0sbu+d9rOZ2S/6/Va32e/5/ib/+Lw3UcHY4COP6uxOommYXL
+#1p5lpa4fkn4jaVwOlG9CnWgd3ZAQs1OngLqWT+mnMmSxjvFZT/0te3tvEzIGsbF8HowijwzTEAb/wWtuWbQa/a9rZLBeh3zPJuIm
+#xgMSrA/Eaj2aB2MhxEHsJ7Bi4gZWG+vim7Oz17Bo8PuWL7AhTZU6TWozrkLhiIoPuAreeg0N9qDp9hoO/dMcpJXpzHPUimr4w9V8
+#TWM9fCDWManHNGRUznB5gaVFmS0Olr4/iTnv5PVzcenf1ADCPRn/Ssy8eEajrYvZwhvT/5NkpfT4uoCQJfCQCoQlTNyoFyPGLMIj
+#jyM/wcW7wQV1i37D8SUlqO/i37Bc0qKHGHk3uM9kRgY/9JI6G7x77EDArkoZ24PsF9mdif/bWuVyV8ZheBn4afZb+p37TzhRllpH
+#c+p+Y4XFX12K0vidEI2f89/ivb2T16/Pnz5/g2slYw5A25gEEZawDvS7N4rxe3B+PiU96vy8Vtt7e3Zy9vxJ4TuYxAequrqwpH5i
+#1faenpydZEWJYgPSyhCM8sB6dfrj92/PX5+8On1xjmIWfXcYrpLDcezaTL+HWNWiSt6enp09f/X3t+fPnr84LTaqW0CrmjSAIzT+
+#+K4vuJnGZESF956ePjv5/sUZ3zPGK2TWSjrv+k7fobI05VjNdJgQHXQ3R4KU5/Y6iDhsESGeE02htCUjgFuTEKtkMoU06Hl8Pval
+#a1C/px8ILDnidrQofIekZ3zFmaxGzVbGBmVthwQXs+UcVPBQVSy8VawdyAV4I4vb1/7EnDuZm2e9+ByKOlTynovhgpucJ8mcEro0
+#fkT6ffLd09Pzkxevvzl5fHpGELVOHj8hAP/9m398++Llq9f/8+bt2fc//PPHn/7XbbU73V7/yCK6Oj15ef7mR8SW9onGFysa40Fk
+#/fuXyabZu/1vwtGrk5en509enJ68Khb6+Zd3jmP/8q45/eVdb/ovKvvi+Q+n58/enL79hsq6HZH+7WvfFWvy4RoxhuMljXzGTjic
+#X09dH4IPsMfCi4XyDu+9PPnx/PF3T3+iWpvnJA7xHzFJXO0SjJMDTUWgPkqDswJ0+OK7J98irKue8Y03L4g7HMhuguJuReFvX3Xh
+#PJgI+1HWQ7QiDr4W1nkS62Furf3Nydm22oMVqmXWwm4/YkA0axer+P/Y+xbouI7rsNld4C2w+JAASIA/i09LgXwLLJYAAVIkSFAC
+#SZAEDQI0AFKkodUKxC5IkFi85b4FCAqELX/r2FIjt3Jbx79YluPGjV3X9a9unNOT9MSnbeycymnS+Fi0e3LcnNSxz2ndxrZOQvXe
+#OzPvzfvsApRoH5/EK/Hhzbz53Ln3zp17Z+7MUCZ/kaLEjORAutYGy47nxYwQsgL1WLyfD3ggls3N4tBj5K0riX5iIBB7KasEVlwx
+#dbMI4tCIt1t6u/X4Qlxv1w2yK61ScRZf4NNJvX0yjgfYQ/6EN//sPF40kbCrmc5mZP83RG1X5s3LMHhMUCCAQhgN5mB/TGKFTDu8
+#icNwiRxoVxG6RW4BGH0OHW24N00C2WLWyU21pBYLWTzFauV6v75Es9nXk/ACYw52QrJVjdkEv9fCSOAByNfxowRqlUOVW57JFUr6
+#SWDuUbN0EidChtBQdSpDvLoFHs34zmLSJAx+aAaLs9eQTZRCh+gPWrcAfs5T4sz0AhaDRNddpfcDmZBIOV7WxBSXjnilEZ76bocT
+#h/GbWzAqiTwfkHy7XveJ7O7j2ZEFcStibOL46aGzgyh8YGQ/Pj6EfWFy8BgMCMMn9dGxSX3o4vAEyHvQFIqWYdGm7cmhi5P6ufHh
+#s4Pjl/Q3Dl1Kkq8Uj8Yso+dHRiSx6NRz59ZbfXh0cujU0LidjstM5Y5akSCJNwcteePsG2F9USSIRGTicKWWoCC2DFqM8DdEaaAN
+#odO6pCJubABAoQFezvpbxrUrb7SNmG4HzOHRE0MXg8DMcHjGRgXUlrhSsELz5EyrUTKv52AQAi1tve0s35LccmEObyPyfwEJiaVU
+#bouEyWmODeU6WoQ6d8bO4KBebZE+eH5ybHgUSjk7NDpZpn0+4infxHKF/wNNJvoYK6iVBaV9bpgtfpukXf+a5aB4DShG5udQrcUH
+#lBh5V8kZhDsXg1N3wrPhlKDa4SpXKgyi9RKpAj0WIdZDPgcq2nmSU/ogTUGWkS3yOnU7sX3hrB1zc25hwREfSTGp7oTPjw6/6fyQ
+#in8AL7EOVGTEGje/hyO4pWuJHPpsg8JvrrSD4q5KOyyvFpMRhAFxH6WdiG6gdKPDJXat3EIpM13KAFadeIWOdmsE8InK/JwvOP3C
+#jRXZ+XHs4SpK9jLxvkc5OXGMQiauml3PgVpuKXp8bhlanDGvD0ziBQCUkLRKYUtK/wFDGDog5nCZO2MBhjNccxvgxoM+Z5nzdHJW
+#Zj63lJsfQL2UW52gAA/07JeFp4rmzQwuqJnFW0pF4+ZNmSC3nJvBGwDi58YHT8Hweg1MARzQ8yDFBx4bHIknyqXEewuugvlnLloD
+#o2PjZwPScidBg4/cjoKG6Jm5CjU4Le02wdRw6TVjE1xFAvvWsmJShRa3U5euTpf0m7g4RvIHl9/I+ueL8HhfSwF6Ga6b0x0U8FrC
+#73NFEhP69QXzJt5bhQdnxWxNUej1jgqlNvr8uRPINS4xp4NayaXugA52hMElc1I/PjY4MjRxfMgAvXNk6PikIptOjo+d5RqKvqg/
+#dnpofEhfTHGeG3AXzmMTUt4nEiI5l/IT1PsEwr2wnoBaAVaqy4aV55bD4xH9EVCBDVTjSE0nFT2RSCbWLpHGd1GcHIfLFKd36QcP
+#9IENmZCKPSBe9hhxsYw3j0iId6wt0JhgLIGQGTjQ587m2I7oMGKgnQ2mhrGEM1HxeAIvdgHeMxJT/QtpUWTJzGBlUFx2AIybeXOg
+#q6e7o+MQXkc2QG+iCuLRJaHlLrm40kDPGWLMpH5hen6Rvyf6JVhZFUY8DGHexNmlBePqHNgNChqKeRy7jLyoEsmP8OcF/BJ8sDBu
+#4v0d8pYeI/744zSzIkif55ed47Y/AyOnunrSKghgVSN6wKJ+Yrrrqe6uQ5nHu9JYAPzLA3IO9KV/Djq79N3CKUTdQNOwlFuQs3fz
+#04sgOHLFBGGC5qFEeskZeJESGBeuyZG037zLl5SpoCu5EhmuRsHhYLDG8ngTkO62cqeEiZt223qOtVi4BwuRRi2AQzUHXQm8dZNJ
+#jSbU1DLZk8toL2YR1jmw8kBfWAAqLyfJuE2Q444az+fa5rJoRwN3JtIV6xLtRB4pBdqMTltsKSsYJxhsaZ7PLeUydI2MYYF60e/I
+#UHv+wikZsYPRBDomV+mTpRaSVABhkZ2iaZC0foRn4RM+boQHdTSaluGgKcqkAhsi2kJEB7GbAMVycKsPDOCSO8EmomknQCIQFOy3
+#1hRPkeatwzZ7kBRztTgbXKpsnCytwuCEl7+pIloMNaSOCcnvqNVCXNtq4QCJawALJHNqFo9SAAwaCRWnRlECgVAXCWonKgdqiPQW
+#1duzOJVAjeRE4POUXjyDapIkVya6qRBfS6LKNcmDxACSTCF10oepELzfyc1O5ZAu6pYXPq5gIf1YZFLnzennJFRJQmLY17ykPYks
+#ElNIzMR6f3HbJemyac4blBtEPoSNLBa/sprghWAkVWh5wnK22Vey47s6D+LKU5ztwApITiQ4yxG5usuUBsNUEFDLHqCWZcEU3S2m
+#tsr1+txyqYiXvU1d57NmSF2aHKUpMpyUIq/D3ELa4QAgMkRSzv51URXb5u6Sa9A5uyaNHRJzndqhIirtwRgUWCw4Fagk9JIrG0Sm
+#pCRD1oN+iWdsmAWAGddztwbmp/OXs9P6cr++zLuEq+dC0p/DmC6W2uhGPIt6+VUQCdBdUR80cBOQnBQW2iz2KYzmDbK4cxjpZlIU
+#IhfIZQLuxibsLJ9AXImb1+2lE+HlgwsawwtL03jSCUdmKs5v0iQZOKCqkA4cnPTCFsF723DoqSBmF4LF7PGx86OTRkdCn/ErxdSG
+#gUf0wdETtoJ8lCvIYnqlBGMd2juq7J2Kz8TTKmcv6EcH9AOBI045dEyaJiidC7cEOEVcDYAqsyn9MbrhTp/N3XR8sVcrGTq8BDRw
+#cG5woCegbfSh22mWYjtgd85gZy5OL1zJGfu6PSMnzWniTC5f6hJrrWAUmnOg5bhWmxLewg4m3AqWSycMatHw6MTQ+CTOD4wpU6pi
+#RoBPYCgzPPbkYkK/MDhyfmjCeCQp/kuUkcfiF1SssDmUfiDriWOnL3nagr/LUP11V6zQ2qT1PrxQyl0BnfqWZw3BQe5CCWicc2Qx
+#sMm98ZHjrx7MJCpKlfl22WpnFl2Zl/PiM4GzLMfHRk+ODB+fFB1fPzGmCwZE1qONzdD6+UX026OuG0gBd+0lB6/udpIE5+ubEMI/
+#U/19ab1Tj3fF4UkRff1pXDGl1U+xyGGvh6YTchlMiD65iucSf6SqVKJ7EpfWeuB/MDkP2MIQ84Ha271u2eeUuBogzcTwQqqWPcIW
+#sBcpQLlGdBiGpvp79h1Mu7RiGqkdA6QgDRPIECi+i0bBL/B9vd/DoHJ/jT1y88xcLytMiWA64QzkimwvuAQ7Eo/nFSQQnymSox7+
+#7y2js+EvThOXvgJ4rF0CEq8Pa+Pzmr7kItqbvnytYj7UV5CM99cs3Yvd6XksT03zG308y/5KlRfAyvWVRJH+au2NE+7UIjpB/a8b
+#x7hOGOOIUUpCh8HuQkvMfiJ6B2isr9vRmANTkpKV1A/0OdqTr9uRHmU3Yd9BDxLicwuZvNg+Qlq6k9P+Qjxlbz/xpBLxCW+5Yio/
+#CCT5yQbr0KFDNjkzMxXyzHgzuet01EzxluReBVDeakVdHaOmQP7gRAHSyFHjSH44HdARIqKGSgaqOl4cGzo1PKrMVvrG7HKDS/Da
+#UJIEvVwASq53iLEXtYKGmeODE0Oo5IzqrgHnyNE9e/RJX7Q+NALJ+dvoCWcxyhmtbOicEdDz0d7VE/gj65zIIY1uGUK+T/t1By9t
+#1q8UqSM4YVYZv21Ik8rydYBq9FoG88qocS2Y+77bO5nK/pSBI6krSCzR/2hH+nWvXXzbHK4pyD0DBbAOOUb76QMo87grJ6mjnu1K
+#iWoW3/o6Z4l1h4okqLikADq2X+NW5/4pwmbpI0fJvihRS+1WBzdSjOoBVk0PN2bcEPnBUKaRfGAhFD4QFDPHz5WVODNocdqRAmJl
+#xMWMiQAA+Aw8RIoxinceN2JQAyOJ5wfwBloqSWGqxB+J6x1kx/PkAfh9DTSugFCOcbKpcaVyeFQ32q0EzlbcSOpTnJNRhxXguA0H
+#n+J//+ETbOdnNbWa42Nnzw5PKgNA+Ylob9bxsZGRY4PH3xhPHNbpvM4yir1HNef66OvVyxcpU6D2scizgPbh1eClbgwp1q3MX54W
+#m/+EMq+o74V7UN09ywgFdRlhnar6fRvSZxa9U9SiZ4+N68OnRsfGh3gfl54YTr8GxCVx5BTOE0nymUgKvSkpdaEk94VIchcI/5C0
+#TqtdjrSLZPqvpWf6+YfD6ChmfSAe+GJiQGpqCaYlQ82bvjKY69YkX5P2uI7qOL5dRpQ/kdjl6arJL2qBN9A1gdxx/QIqz3sdbhWc
+#xpO0bs75B9K1tR38BXPf+NC5kcHjKvtJP4+yTLQuRgJWynNXE4/VWsFaXcNKXZcRuhZU6zNN12t3egrje2JdqQ7cM0jo5+Muw9/2
+#CoYtKC7AVNJsdbkFgYDkix+/HKNTMTddwPV8XmI8Lg9c4R4t0nEF4Md1Z9tL3Orn+qTwYSGtk/b32EM292/h3i22bzm5VaDHEtbF
+#d84iLE5ruIf2fC5XMHq6K4hy99SS/JUzJ+UPROM8zvJOcQErF3cTcrEnqWflqpDqQF1SF4KPKuvA6sKpPfy5F8Dtkku0nEgQ+AEL
+#HtzKkfg+qUhWOXV8LTTiT2gXAlv9jsU+ZWMi7Uz1ra+dr81jqKRO86/hgo4/ckPnXK/4nN//5Sm0YclXnLpZPpcpTN8idwx1RWk9
+#Cz6LwQs+HarrlsskUhdAvGvpgnakDQbOwJPngh2Hl+cG1q6sTkycP2vYDmbIZTAwdUlLyMrNAJ+hL5o3SYJkQ9JZuFpY29Y7NT52
+#/px+7JLi/jo2fmJoHKNI0pyAGoT+X7I9LDkOpufnFRzkyzctnxJ6HPoxCRXPfp1Bg5bfv0bQugfrgn5mbHjUPjSDu22moAsWUrYX
+#K29RIVWWWA6g0msJ+tGKYhf0o9uDE0wrXgOKr4k7Dc3n8W1JYh2Bvs9gN8VFXfxOExkFeVYOfKcjRdJJe1uWxaMX4ulVEmxFWgMD
+#RApfKBOkG87YLebR/URWl3a8KUSDBLfjOjpumoF/3faKAJVJ1FFNFYv2Y1mL86UMJELYpTWNzRBapxqaKck1aMHxVAaYzfy4kZt6
+#54Deo6xHKSnE0SPzFZKIU0iyThK+KC83ZNmdOUCK2iMCTT57hht3lxRjD59k8w8//f51C5FreuGWou+R8xCxrK2j8iJtSR0wCWI3
+#yM15bicVj2uTPTvumhYUM+EybpnilGlu/sGOSKuT2/ybCKYrKXHKBDfPpHCFOpOtfpzhX4V7xUJuuWQYLj+acn5ANPxxRwfhmQVt
+#R8pX1DOV+fApe8lBmQeU60QFh7udtQ3XZJG9IgSx/DWtLvxArHhPK6systmV8eiGWILo5aRVhZVMNDcND0cldbdbiNG17FSPTiK8
+#0dKbFKz8VR9Qzrqzrb46y3C0vCqRuKgg0Zkq5h+UcFoKOXmKE3x2tko5n53MTjAdsLYh9iWS3FMdc/iLs03W7ipWUpyoQ2cxrcQp
+#p/DCIZlHKztzJGhvJrkooqRYPAodfM+uYsPpwJ2So8XbslHsl8Hhb6YkOjYKEvKBGdD39ePcIwBHx4CRVwylpHQk5GTKXl/KGRpT
+#RUor1+/TGUSYhCw5u6IIOSoK4B56JF3tb0dc30isihbx8RL9deVa+vxcfg4A4Bdwqy6efk/ECmM7Tb6mFPUln6I1EYgTkzvwyud3
+#yo3/eXGOlNQE8C/1QnzhHQ/f5H6SeCWRcH+UCEcLErCTIgRDBViROnw9eRLNg0cqThcEo9mnkwgSTwlntiKXgkm9sn5iySP1Kmso
+#fPQoOkOHnMziRYoAfuDzVhTNX71CTRkPimUHg6JnJLDPB4MP4l2Ry4rWYQvgYqAALioC2AOWs6oOiWSA6qYujPH3rOf4tDG1C/ET
+#yyR1827vaF/XyfNBP6DrlNN5OStKzpQLMo5ym1f2OlWwRrBiv0AhkCraP7KbcDCkI3E+0JEYf4VyBo3LYYfeRZ+WPVoQKyn2hPG9
+#YGIPmG/v13oQZXdaIbJpMxl2XLlVTVozamt8PVF0xLynI3r6Wr5MX8sH9bV8cF/LO31N7V55lTODnA5mXKm8XS3v6mpBvQBZw+kI
+#rurcxZb3P1i3vnUvipXTlQvuriymIHl6/l5J5+KTjZSa3soobfxwvgw/nK+fOk1hyju5SPr22kpbwbIPUKDjOqaXQEbghW6Kazyd
+#60CBLN/+Yh/sEbD1BUuexZJNK4WDNiQzsh6zAjfN455DdZcMbRRCxXvWNyUPsVI9pKWmeKqwcAUXhVLXCvJvjr/czF1G92baESDO
+#n8SDPaYGu97sbDLqfAjSIgxB1s5iaQo/yQpx7mqWKzruzX+OHPFsT/n5+DhPL5aucgVvupTLmNfR2doeokHLypo3lZkkZdeaI+Lt
+#0zYc2HH9GKNBDSqJMxx4wXRah6HMp/E52huE2RtT3WlQ2NAi5TX36zdSBbOAXOmW56jO3kigtzBBaot1WmR0oJDedSVfZgQO8uv7
+#u7u73cSyXfelG784/IKao8zZYu+grXdLuAFNgN17oLs73c/TAuDGdWG0qXTE+Whbqc7mcnnhRDtXEIgWnsLKPjaby+Q+NlxuoWRy
+#699igebYY0oT8XsCt4Id9I9665kVLLPbpiNgSyRunPU6SFOjKg7IRXKUA6yBriEckGn+we+DuvY84vrduTmwCoR2GdKLv2gLtkrF
+#82lRLN4x8AYc2y+pHJvhdWyR/gNcZXHWIPBMCLSChGs4PyNisThvTc/mjN59wftU3a5jvuMlbOdsgWH7uAhiuPX6exviPLGUdXV6
+#3/4DvPwUbRbE3py6mlvOzl3JgSmVsCsscYdIQU33uUvpBPARdhaCwtU9ZG6swd7gxvMiynnVjtWJjERRfia/J7a2HO3TMzXs4FLw
+#uEAgdz+6F8RQjyu7+8xhO777jCxWsc3vfkt9PIQtRtfi6G9anMNNispJb6lJeWTS2bnl4QXX6XEpOvKOe8RxnGanc3mgDd+sj6ov
+#yTf8AoqkeTNTzAHZMtPZLJ5Orn4WWzUy8FzMZfAKWfh6oI/LJzxdrLQsZjs54XbRct/kyAT5uwC+r+fgDQW8JY/zF0WKM5/w/Do8
+#Bwug0Gfm5/BEXXE4EF1xr0/P4MCLBzBROxxHGnJRMfAu2qQsMilKkA1RRBKCjac6wTiewUtFjcRUT9or6xQPFRD1xnF+7AFwmdhY
+#PcnPMRAhy5pPTUyMiJDQDLwu5WKZibeYQObn97db/Xp7kY6jcsMMoyv0ftqQzUl/mppbNFT6HgMdBWk8zgsWSaRDEVfwcZ4Jl74G
+#nOPVzuEpBHweAnChpuCR9jmIA8oYXSiaJXPGnFeTY917e1I9PJs43gHPP+t2yARKxWKB6KOghLPLFbBFSyVOPPvAw7hgp7g6Ggvi
+#YLY5i2iE39woplIEilN0mBSB41o59qZDN47ScgqvLc7wXmWon+1tN3i+tXIqBhWzSIN4irdP4UsgdSYPFAQ9X7DlbB5K6phOeNTF
+#GO8ovI/n5qE4yy5kzocyaP6EcMJQjuvzsNnyLA1J0AJ+u5aYvr7YddIs3pzG2w3wjbtSeRXs5VlbKi/Pyi37yXgCONE5rKBvv9Nb
+#5BiA1fmYV2WAhWwGt58LbJiXr9G5M6VFa2AfDioCVDokRGkPLpbKjevZxXzBMignSJBFMPCmrZm5OX7cSEKKcLkN3qERZyyoH6Aq
+#wCgBFKGKg5JwMIz4cX47YReepBCn0xUBFTN0msleBOawfc1h+eq8ZY3kFq6UrgpdkDZZQuNUv6OArLivvQsLKJrzcZrj7cLDUnP+
+#CmcWcbeVyGkpupuqEhvis/DH6/dXiSk9ZTtf1WLp001cAxHH6lFrVIp7IPKwsr+xF7tUrHeN0Wq9xVttLczNzlbE8jhe4VzMFbvO
+#mUCpWwJZRRFbMSv0jCLY/2qNJ4ZGL62LqBOimUq1wnzqsooz+h7MueewPpe/ooSJrfsP63SrpBq/Z3EBVceuOVotgHyzBBiOQkh2
+#S9+DN1JAPBqmXVCxHQFUzndN0wAlCosrxMDB1el+ChUWHHdTv8TwMK7t+mQfR9mp97htBLAF5Md+7mqkHEACQss0QckuXlHZtzh9
+#U4qrInETwmoscIuNq1SX4yurzoy56yALy4D8qWzO1fXJxoIsPvtFGdOzwus0CEwQMXgjEmiN8AddIb3SLutglp+LK6QaziIpyPV7
+#m+KkiXJybiDO8YO6B9lT98wU1pJOLSHA1DDc3wF9e0asmDiYquwhJhdm4k5jSF33cIgt4BWNnkt73oT4wrJ0zUCI3f0fN17bDfUX
+#SvuUwNSwj6ZNcyfgKftw2jQR0wga9PjBFxWHuXOorvCTMujiakv2CTHg4t0NZtYZcLNm5tTQpBdYHxnR+0YebcxxgfNWbmoVkjSl
+#skifnPOPjcUUKBXFW36/fixG6lz+ySh1mHXGUtVRezWp93X3+cotUOPpmGpn5bFcaU4K7+EYygG9SB16Ta9Wqo3O9S1flfjsnWms
+#XCRU78OMvZMfayDuLLuZhJKWBynY6Z2vAxN2e/wlozDy+XGtk3pZ9dyL1w2NF1V77UXlXzKUlecIuQjuX+cVQ5Rxg/dxmkIUuwr2
+#dacTZCft4xsj9ncnfOn5wqXIINOrrsBevsvz2Tx71tiD073G49nOBM4dF3xEyP+y4ZtYNGDZDxGUT10pmmC59Hjd3+8v19qnBMfL
+#SSm+0m7hBJARJ9mxN54IwANqCIZr3QE3kx3A/fC99uF85QsWd9hUKNo+aB7LPYjlBhTK1x720hlncwvZ3HIK7xWmoLjwC97o0KR1
+#VBN3lRBUG/VqeZM5PILEqr9Y9erzIOzcG4+VJ6E8dO4Y3ia+cG7OPnrOmTIZz0H3E4fQuUdJuWKiFLSmoy4M0XzKhBx1nQGYT5Wo
+#yemMvHU2UJx5zMOrKEc8+PJpU4oBL5SHc2MTa2sPhWDtgZ73qBWAhlTG1B8szHW9MXcrwMgXJdO5CFP2rQFpuR8Mb5+gM+6nQXkT
+#E6G0DqQmLrNB8t44anEBV7LM4txTuWxZ4YV7dmzzwDZiAlukjH7iQg5xhkYwWL6DgdZZqNy4sFbB7mM31lm49H+sWLKya3D9o+tr
+#FMxBvDV6MU6rVHG80pV+u/QZUMzxqhBK2a/PFE3L6qLLVdAwteQ0LkKkz5VeJ9S4D1FMznG4ywpNRC1ymRDLfradK0juwqmtch1F
+#rrTG5wr9eAjLHGj3B5Py5AhXCn7EbhzPceimFPejq9hHJk2XSngfo2WflcTPSUoRGvYdeu39p0gKD61tOtvkqP8kaMGnLGbuS/Nw
+#WxG/5NcSV+gBWq+i+KeFG7yc1nUXsHJRKE1v8ZvxzAWBCC8/4E9dpMK2+hLMXMfJbMeYHWi3DuvnQCYP7D2snwbjEe8cPqxPgLU9
+#AXw9MDK9fFg/O73cNXglN8BPZuNrSck1FtACcelM4tkmMygPAFMnAAW10he/12BFPNOWLtSLgRGnjPhErtRlzy7MXE+k19Np6LZu
+#X7XQTslUQbMAQQ2ELMGssvY+J/ytcx+QuvIXvNZXZqXvXiVpJdyqTLR+FuqOeynyy6qgOVNlAWsvr096r1cFREXrl1EHdFRxsRZp
+#miVckZzH4/aXM9NXcq5JsHmSuvOpeb60Yh+YjL/Zxfl5xSkKhPc83Yrlun7JLl9ptJDMmF81fnwFYd4EDGYmXidcsEcymW7OonZg
+#MWVOlH29fDmDl5mhcSrvNUtdAaawMvjO60XvIpzLVVdfzJkSdDZAGC68u9cFIZ/L3EMnsr3c6ud1kdnmWsqZXprm578HLfLQdVvo
+#qrcXbKjOZbDPvGeEUalcRLvXgxCguIiKy5NEeXLvLK1zpDO2Gf0dLwce4iyWwvg47l2Ica9v7VP5ds3FLQLrF7WAxScWqTt0Tdsj
+#p+gcNH8iXjmaFswuOtv5Hta7XsOalVhdHxaGllxldy+lKwviikMY3rAmHSQ9F0JxqSBvYKCQw+rT2Sxn9Ar8mLomr1EKyufmTEyO
+#lr7tUOY18BxmIgn62OD46PDoKfQZ1UUavhtPuX/pML+ugJ+pincWgnqWnbNwplYuiihI4W4pRty+NjGeDLiWCdRJD5rFUYD85ka7
+#GMhJl9+lk869T5DXlccCxqBDVGlyPy5bXnlBodLyDDkkCFcOYvrlkoHBc+Njk2PHx0YykyMTmYmh8QtD4wlvTryCei6/mFdcIzAr
+#5LjAI/B1qSezz5eR2AahzYDAAG5ywZ90r4a4B2d+057jegNP94jsQpBVfmWo3DiLvjsz5uJ8ltjpMvTKBaI+He9zmFRwPAKgMI+X
+#VKMjiHJdl3ONG/dOMkq48lca4Pusk8INiTtUcLFtVM4oOYl7iaAbeG6pYkHUBH7bxmIBdYX+vXvh0Z7Fc7ccrnbu+WzPJrg6QXgj
+#1PuYMJCp1XWvklkwOjLqDFCZ9gjyWVcXS1nz5kKFhvDbPVP8jyFCE8OnJofGzyapxsrphvkdTjKZrFhFox9l4pwHXDKLQa/K0KaB
+#TIZshEwG5V4mI2wDLgR/dSf039NfSk5P/RzroFue9+8vf/97t/f+5559+/qYvv/nCJP9+wd+/7NNf/tO4/vPCfdO/96evl/R/xfy
+#C6C/UHJSpeX71ODK97/TVw/99/ceOPCr+99/Eb8eVI9+Nbr/g/0F9H/7LZWdn78fdVTu//sf9sv//fsP9P6q//8ifmff/ByLwN8q
+#+Pfqq4x9RcQ/uo68T8O/xp1fbWRfqP3Gg18JjXzjwcmrcxZuJLhSnM7b2ztyenFxgS6lHpvQ8VrHVEND7CFRxrkhxkZCEZZ/76nn
+#ZbnfY3G9LgTUvwABjce9fREeuqiUsY30HuZwM+b8Zf+Bx+Mvwp58FybF/52/9h/6dUO5Y6IxOyIBjfxNxurhTwGIP7kOnNg/gK9G
+#CdZA+LQSTuEEBPx9z3nRrgsO3EoRT6aKVnGGCdgARmroRXe6R+H/VDE3b85wWBFmKutxX7pjXjCzi/zvacpSzTYehkoPMRZaVyP9
+#vwfCK5C1qiMejqzSC0SEZURYRERkREREVMmIKhFRLSOqRYQmIzQREZURURFRIyNqREStjKAXgK2lO8zOCTjDbQQe/EGgwkUIFAic
+#cHEvviIg4Tig8lGqMbxzA1UU3krFh4s9mAgLDhttjMU6thUHIQb+nOd/pvmfX8M/AEtMwiJfjK3A2gDU9m6NLYUI303h4pkQKxQv
+#wyN8V9sJCawtUDYmjYUhZi/GbINAmwHJOzHqQYzaQVFhEdWNUW+gqIiIimPUAxRVJaJ6MGonRVWLqH0YpWOFmojpxZg4xkDbO41d
+#8PYWeFS1d7XtfgvEV93VHsYk0Jlj7U/jFwOw02nuhnCs8wHN3AMvdeGVBvgSNQ0IjBgAmWYm4FUzofmxrm/fiWlJTTM7IfCdMKKc
+#PRo2tmCqOngYSWz8Xc3AeroQXiuFAAEuYqubCf/Q4FjxK4C0rc9CxaH21rAJrYu90N4myoEGai+0bxEhIJr2DHT50AvGPqQcvG1E
+#3v8m6/gpI03oZHhlM7UyvLvD6OVpWrpDrJF3qyajD9vXzIz9+O33w5uMA/CSbA+bD+PfN4TNg9iyzWETOlLsVFd9mLe99drdSEdr
+#B5SlsYkQyifWZEESLaaFV9uhxogBRNK6Qh2ROk3ga3UP4a4f3utFAyCbltRFIIqPw1hto9K+1u6GcLS4LcwKho58RlhvCK9sgMK0
+#FSyyuco8grmmapuqLomcQCbt2t7hcLS5emeqzRiA783VxaewlKP0rqbDfJcMqKwT0jzvpDEeRfJQrWp9tZzm1iCySvHbkN5LDvMY
+#ffoRfNJuYxbjOESI2Fcgtobe31KPn4BOnau7sfS7Wj+yxhDWehIeuxG/VWyai8qmSDPbso03hRWrIhJM9pZTmKEOwWcCkiZkt9P8
+#67DzVc1VJb5TI80znDWgvggDNgXpCfWZb0Tm0IiSye1hrdUAMDXeBzROU3ME4WzteCK8AnVWdTVgz9K6tLDRjrTr2A5yCsck6IZN
+#xRqsvR67H5TQ2d5Vv7uZ3d0MrLhd69xpjCF2XHF1xjlkOutNgkfHsQveqd7dWneHRTuI10nen2bV2FtkXdHydW0IqGuDqGsC4s5Y
+#k6Ku82vVFWE43JCsa1vFtodbV5upEyODrrbg6wq0o8q8gAQggfMgdcWW3Zvuag84wuZBj7DZIIVNtI0QLqTLX6nSBWnF+/oY236N
+#9/Xt3dXsFUZjdZMgR6iDwxDh1Gpm5mNY1BkLur3WLmJXWxEsTlaZMExdqitKjekM1ayCfK2KuQrTzIvYDSLUoVfbkCeqVnX6fgnJ
+#Vhfdsi+qRVe3IPdGzDcTyqt2b+qsNqbgvaE22afVmo8j1le3Yu5aM02BbTzwBAW280CGAjswEDGfpMADPDBNAQCz6k5k9x0mZCBj
+#z7HZv2ERyRdZiIHu2dQaa60rxpE3GhHhl1EWdXbVoLoBEHHAt/TGas0sFhvrbBZxW3trRFxdDSfHf7kTq0lqNZwcVLUWtXLYjUI7
+#kC6b2KGzTFijVez8JQmLxmIg9WIoLweEvOwktlm/QAx1WLPIIOtnqhbt4CVkVc5ZLdFwk+AtTvUmIaHNK9iyLe5IZ5hrbalpbalt
+#bYnBJy85W+qa6pIPNNVxgrbUwBtRs6UW3oiULTHCUlTITRSOogqvdGzig4SIORahGCKDKl1HML5GjbmIMbVqzCzGxNSYJV4asZAa
+#/3YefxUCb1Tjn4F4D5Lm4PlMWiYxr8GjiffR/g/dffXVO/VNWjLaJDoqqWD1xd9Alruu4Gye3rXd/DthxtiDnXIlj6y4soA4rVp7
+#jHFGk/bi72AlpoO5L2C4gNAqGX6XGoTS4ZknndhvYlIU3WrkdyDShc6/RiRVqTF3MR8yiIOQ9mJVFStE6b2lWmuqVoa5JB/mjnqH
+#OTY4wnvKV+EfqBHsx4x0CoZ9BtV/QAqbBw7+85CwC8TvBxBGPash7KTHPjYO4TpbDiZrwisom5MgD9tISt9L1+ls9vcbQfCu77up
+#DWMA1qdQMkaUrDMeQkEevWjcQIlTI4gJQ4+2N9ShRbtjUa070tpZtbUztKVBjBtFBPEht456EMG0CEz8YmzAEQ7kXed6eGUT0KW5
+#pm0L1yFqlFRGE+oHNcUdVVI/AIzhEMa1ohquJARzmV6FDIWJVR7orgpgDGQozctQUTXiSJWH5c5AhKuTI3M1VQnuCq9A26uKFzFO
+#4TNrCcG7yUjd7nAzm1Cyb0OWbULJptaAji106fYtUfGyFSpalv3Ho2OfYDtnOCuiLQbaMgaaQHO4hcNhCvVSFl7dS383r3bR39s8
+#2mgmbYxCxgoVimWcQj7mZdzGMvpEGfvpb2T1AP2tWn1YlNnLy+TJjBZeJoaMt4gyNQZ5UNdvIlLAWLOyCb5f2rl8DdgurK1ucqyO
+#vwWEtAmERF4w3opFvBK2WlCZQUsvbD2NQDXQ69vwtdGJ3UCvb8fXjVTkOzD7b1nvRJJtu2a8C+nxbng8DZ2yyvpHGN1qvgcj6smi
+#Rb3zkK13/hp2HE3YIns0bovs1Lgt0uZSQJXRCWxRoXXCS4JehFoK4yf1f9RLE2Ssol4NIyvbgDKi1aW/OUqbsOAUiw31xTrUF8lo
+#291xRpjYbdTo92KjUxZArT0d55Y7jxuP8CbEItSE1rshbjtVsZeFHFMGxcjt1gCLIbKCdShDYmQFFSvvgBhZ2eqJvUix2zyxsxS7
+#3RO7rRpjd3hiDYp9gyd2iUp4wBO7j9LqrtHFRoPSVzYqfWVA8PlRwddHOF/zaGMT5+sBu6/YpSH+9qFWQ3IeSq8i88x4H7OtFlKA
+#DaT8FpECbVPoBglMSJad1hzaeXQHF4khxUAKKWZVSMnsNbBCioEVKp6rdvI/o+ZHIIIyLDkZHEtMaw7v7NjKYQorMIUVmMIVYAor
+#VYSL37SrCCvGnkMUSZNmhSbHBE2OC5oMcprwaGMzp8kxR36h7ZEAWrQQLbq4sYDCr05L7oee1U09C5/14Zq2ixSu2bnpyH9Ge42E
+#ePh2DzL4s1DcoS9gl9CSo1EeufKPsTPy11/HhnVic59DPak5YrwfhcIj4db2GEnZcO3qPiqOZG0kbEBv6nz5OZzvWMEPDeHb+Ofu
+#ZugS28ObRS4o559ij+awNFeZz2Po5eFXX321pTpajGswxjmwFE9rOOCYH0Bg/hk+QLHR7my/s7VFC++8y+EgAJo045/D9zst7mjj
+#X4j+gLYCA8n/nj9mnXyqspH96G/ZVnw/wNNGjA/yxKjXPAx6zSbCcS/H8X7CcduB02HjNyBZ1Jkm2rnX/BDibQXHDePD8Gp9BPto
+#eAUHEOOj2I5RaIf1MeSJ30SqH0RTRUte19oOc4RhhPlxTFmAlFHFLHkBlZM6oiol+gQW8iIOyoA945NIk0GiCcIZbqpa7afG02DF
+#Jxo7X86HsA780AKf+okqOyRVaHSrMj6FVAaaHiLQ2lInwiv4av5LrO+38fEcaQLN1ZwRBsNtdqXVq4edSvmMT+fLP6WG4QdQH24f
+#drMCVVpNrCDq+TS86v8XAN3brMa8H2J6+7a3oQ0HKmKzVnynJnuZpiTkipVG/c76V/B4qv7OY1rr3haeJlkn0pL2yOMPiviDdjzo
+#ncA91KZNRCP4c8huWVPU+B1ksXilRDXGZ4iJUM9Gffpv4N/X4d/XoB1b5Dwy/ANTjj0Fcf9NiWdch2Dfhbgfwr89XEdH/uwj/vys
+#5M8I+yp830z8eYTz51EuA3rD1mHUJB4hjsFndLXDft+0atjvxecAkasJzolnoiTfiv8HuW8FJ8mcvk+M9n6H0Y4IRnuUGj0gGG0r
+#0nwPMdqjgtEeddP8CGc0pHlz9d3NgLpQU7Xxrxnq6ebnJHk3RUF3jhj/BofxB+Dl8/CytXcThxnC/xb7D7ai85CS6wHMFeW5HhRp
+#o5QWZ594BI1F1OA7jcABtcqsgt5SIxDQEUVjlwucD9sCh/ES7mpHpIJifAFZQW+pRWY4wrngERshTbVcGm0L/CqFkuSRP4R/YK6w
+#h0Oc/vI3hLwCcadCfLlHLrFgmhvw9lYl/gAvWpFhEdYH31uJRwY5jxznPDII3fvJ6ArOhhiotJtfRBrAoPUlR8JjjnDN6gkCmkaj
+#cNjYhjT+H9SvT9AIc/sEkfgIGo+bRS4o58tQDsqQIV5J8UIUuSrp4ip7RDlCgmSQjyhDTn0wooDa1HmnFF4Z4sPJkJufBpXhBChR
+#JSp7Okp2i5eCMGRUIzUG7RqA+Zwhw4nm1OHjxRIzv890OV78LBqS48UxFdfHJs4cC4nVLzRUlvpS3ane7t4eVLRB08YFcVSvdoG5
+#8Dz8fQYG710TpSI6VmMKHdj5RRD2u85PsP+4l6817jp1fhiQy/4Ews+Abbjr2DxOokn5EXqs7YW6Wpz1eiXUi0TG2q9zu4b4Bkww
+#luB6PvsyyhpGvED8hvyDMgfXGrGZmBeqoEm07VRDV4y3RmO1NZ9o1FiJnv9Ve3fDBvYHjRh/PDpSq7GpmifqNPblKD5L9Hw/PRMU
+#/xMNn38axbzHqITva59ojLHq2muaxr4E742sMXqwLsba6sIbYuyl2DUNvoauac3sj5o21jeyuxteqmtlvx+ywhr7EZSzjf2Y1Tdr
+#7Iuhj8Ri7C/rP7BRYxfga4x9tR7LXG3C+P9d98EGjb2zHuv6TBOW+Tg9/64On882Y8pvs4/ENDZI6XfS15tQeyvLUl0ZDb8aBPm2
+#2LUNGtscugYQPkoQ/rtafD5HzzMbEIbPhjD9mylXB7Xrx00v1TWyP4Onxk6HMGbTRnz/fB2mOVuPJT8efTfAWd3wicZm9r7qjfUa
+#2xHC94/B+1vZX9XiKvP+ENJlthrr+vcbr2kbQi9XgTUV+u1mjH+p8VT4Afb56gTk/T5DPHyT8DDe8AOA+WvVWNdLtfh8DOqNsxv1
+#e4Fqbwvh++c27AUGSlUT3ijNTyG+ke1rQDi/xRAz3934Nmj1rRas/TuN+HyC3tP03kB4uxHDEn5GFNlf37Uxxh5qOAU4/FzsI7EM
+#K+CCHPuDGJb8dN3BumbWTC3dXfvnzc1svHljfTN7kp5v3zi+sZktwXM3O1tdbGpkVdUv1SEX7qM17hD9t5H9v5r62IAdejlWH8Pp
+#300sEtrIzkDP+iDweR97B4SeCGPoQbafRR7cyEwKxTEE30A1hVA7yE4MfYxCBliqGNpBoU42QCHsCd9gXewRCr2dQr1skEKfDmPo
+#CDtOoa9RaBD6X4i9oeqj1SH2UuTj8IxUvQjPr/BnBOOnqj4FzwOU5jY9P0xffxD5dHUP217/WXjeqft89YOsN/IleO5o+D14Vjfh
+#+z+p+Tqk/GQtlnyDyv9I87fg+Rd1+Pxh/Z9Wa+ytsW/Ds157EZ5PxT4Kz09vwOclev7dRnwuV+PToPf3avhMRr4Fz47mj1e3sq/E
+#Xq4+wFLhv4T3hvDL8DzNfgBfn9zwCjx3tWDJ76JazGp8v9WAzxuhu540n6SSs/VhjceH2AdC2N6/CEW1EPsjtkFz0rRpMu+f1b4o
+#SoDWhXZCyh+FHqL0CXh+KqTm4iXfhZRfZL2+MvnXhyn+sMh7DgdN9oc1P4w9GwqxiyL0sxhy1DSF3l2zKdIeCrM5EdIjb9LCrChC
+#j8XOhyLsKRHKxjayCHuHCBkt50NV7H0i1NuyEdSr50Xoe+FnQ9XswyL0Qxjaq9knRWhD4wWA9DMitKvxzSghRei7Dc+Gouz3ROgn
+#DSEWZV8XoYcbnw3VsD8WoTONIZDq/12EQgBLLfueCG0EWGrZX/PQlnmQPDF2+kHe9v9UfT4UY2MiVF2HoQsiNNiAobQI/S59y1Lo
+#f9Z+tyYDEmBehP5XTRZCizwUOhzJanXsaZ6PvRJ+k1bPNu3ioVrAZwMzKPR+9jOQyI3smAh9LbYAoRKF3sYery5pG9ifPMRDO1tu
+#a03sRDsPjTW9Q2tht0Xo6eZf1zaz59t5KXr9h7Q2mqbG0POR74bb2PxunvKzIAPbuHoNoZ/VfgxSbjF4yp80/pa2lb34/9t7Fuio
+#juvuzNvP29XuSrsyDjjGWdlg0AFWEoggbIwRkgAZJGRphU1SZ3laPaQ1q91lP8AGE0s1cUKN25LYp7Ed+5jG6SltHJvUSeMEWnBI
+#T9w6jX0Sp3Ecn0L9SYhPm5Dmc3wc1733znv7kYTd9LRpe7oD7747d+7M3Llz5868p7czi1Xa28h5GehLVewgx/ZFVOwZz2HtMjhh
+#xX4cesx1GTS0qNiP6siLDLaUdT0fjnDsyNys/yuu+XDC4gzAX2FMtKrYEfhb1/vAa8U+Jr7raoJGK/a8wBEBS63Y2+hvroJca7mG
+#BXBna7mGBfCJqrT7OXYHvEf+E6Y9bsUG4UeuhXBfW5nzanikTaWNwWHtavhhVdpPrbQTQLHIisq0jhUqbS/nu41j58SzIUp7tl3F
+#rnO1Y+xsezltEWRWldMWweSqctpiuGd1OW0xPLK6nIZrm2vLabTSEfAN/T8PL/UQfFuW4SIfwSV+WjPV+WyKhFdDhL+kE/5Dz3Rc
+#8SwPgRUE+jKiXNVI+Oe975S3Ep9gGeY32nQBfa6ZUAMaxc9BHV4+vPx4eSCJHiII1CvzEHpRO0l/A7QxXM2wk2EvwxsZbmdocN4E
+#wjn4REJwiss5xKlHOJXol8FphItgu0j6l8FR7pGj3BMvCOIvci4hk/4NOJO+5tiC87PCP+v7EI4MwhcwXMqwnWGTxf9z32PQzHib
+#/HrDUzi/Er5ajrqeh274kP/XgA9OIZ/oldfKoIjCPd754kb5bGih2C7/EP2mId8KNYsEl/A7mLdD3Aev+NYiLPq2IiT/NiWb67aL
+#F+BaXPdcgJ+FxsUFOO2fEIfkQONuhEfR/5+HPVhmrxyR+xFK17A4In/guRtrPKEfEQJbej/C96H/F2K/9hjCNb5hMcptH2Wp7pO7
+#PcPiqHxe/3OR5FYY4p/r/kYcl894vy8oVwMcl4+7vo91rQw2QFA8qr2G5f+9/rpok6843xSr5UNBv3xSng80ydNyvnO/yHOL8nA4
+#6BOn5V1ah7yNKbcx5SBsxNXVQZbwIMvwtHzEu1Weh48HovI5+eOGD8gX5J/UdyAcZvhGA8G8swN57nQRPODvkIdZz/ewns9Jon8a
+#a5kvHuHWRWFt4+so83zPKRmFu7xfl49Ag9YhLsgLjmfkBfk5fVh8GnaJb2Oub4l/kG/I7zlfRPhswz9K6h2XdhCa633a56ye3RS8
+#Wlstnwht0Z7gWk7AI3oH1RW6WzwnHnIVtefE50O3I7zUe1g7Aw+5HkJIlDNwqfdRbUru9GxHvZFsBxmeYHgfw2MMg9q3/V/VjsGZ
+#0FPacaYch3vqntZ2s87b2G7b5N/Jn2rH5bOO76MMDu88xxPciie4Fc9A0L/I8R0w0DaeEzdoHYh/GXV+Au7T5zmeFrc7yUIiwX7H
+#c+Kxum0InwriUxOPiybtq6H9jiPyeceUg3judLyBNR52NGsL5T2ONg1tCSkbQp9BeGvDnzl6tQbtcccx+H35JccPuN5XuN4zQPW+
+#wvWeF9eEXnas1j4lzzvOi7XOt1AGGqdngGo/A08FO5Cfaj8mPuVqcR4TLwdXO4+LWxuvR/hLxyaEH0b7fEMGXf1OQwT9tzrPCarl
+#nPgySh6GHDzqbmK4EO6Cda5F8EF4TW+G/fATPYJeR3dHoBGCCN8LrQivgtUIl0AR4Qr4OMJr4V6EXfDHCDczfQjhOi6zk2EXxOGk
+#3oVPr5tdPQx7sXzp2cGpBsM488Q5NY5zzLd0k/EEctZ7JplniuEdyLnZ9VFOPYSp8z0PM/0ow88w/CynHsPUZs8pppxm+DWGTyN9
+#lecs4+cYvszwPNK3eEAQLhhqDD1iP5ieMONNDK9i2Iz0omcd450MuxjuYBhnOMnwYYanGJ5l+IrYBV9wg+S65CfhQV3Iu+BxPcyU
+#dQyPSuI5h/CkDhpRwgwXaJ+E7+mntDimNjmopZ0MDYZTDI8yPM3wrIM0JpyENzFc53wAvuzuZHwH4q+4DcanGJ51smYYBxfXy7DJ
+#RXI2ue6Cr+nrmNLpIpvZ4aLydzBlysW1MzzN8CynnmMc3CyJmyVhuM5NrVjnfgBCeqebSjMYnmL6KaR/QD/NnOcYgv4XpDGdeNYx
+#buhEn2T8KNNPMX4txMWk+A5a+gWxSPbIHfJu+bLMa5/Q/lJ7VntRe1X7pQaOWxyac9gpca7V+O1IU92/4sy7QPsVwnHvmwhXNRK8
+#IIm+KPA2wjf9hPcHCF7Cqd90EvTUEezxEzzFeL1Hc6uyBc77Gl9OxB0I6btqN+KoFMTdOKvTyt6DuAfHnUBp6mhdgjO+wJnfj7gf
+#6oG+N61HvB7nf3o6DiIexBEqIISQvpWag3AOrn4lPiXPQ/geHLkS5uL6VGB8Ppb7EVwveGESR3EdPu02IzyIuA/uRNwHH0fcD7+H
+#uB8OIx6GYRwdv4trg4fxCevn4BSXihbxiDgpLpNt8jpZkB+Rd8on5FxtREtof6SFHW2OM45vOhyT078X93nB/oyLwx3O97rUCgpg
+#b4l1I78LqOQ7bL0lqM7b4JtJe71+Js0XmklrnpH3XufpWfK2M83BvUYrMQ37ScNe0rCPyF401J2GOnOjrjywCibwug2vu/C6H69j
+#6Be/hNcJ9Iw/gdvhYXEInhC3w0viAXDLB/F6ANI4H3dqrzP9Q9ov4GPam/CneD+L15voqbscfeK7eP3MsVAscC4UGbz20Uu/NRuS
+#hdz42tFYrL0V1mxJG6NrR2Kx5StjGFsbj8W6Ezk6+6yLdrpY0TEbdflqpq6OxVYwtiGRSuTG+2i3OSpKEbemNpr5rvSoSSSMRxPx
+#XRY6ZKZGB429LEJblQhts1ZG1I4Y3aoKJXKBbhsKqfiONugvJHlzYER7e1KFCTNrxbrSqXghmzVT+RvpQBJKH+DfKWHCzsQYxqNG
+#bhfeOnPFVJzwPt7veX0hkRw1s5iw0Zgwe/ZgAda2ElaWzr1GIs8xu8J8mmJbErk8EfPmBNY+tIDFT6bjRjKH1FR+xfKqVmMstXZl
+#jO5Zc7eFUdOWq6YtB95JKVrIYHOWQ3eCt2IyskWMUB3Vpa2ANXSWFRWzggrMKWwY631/exVnu+pExFZW0VfCmJmPDUc3dBADrOlL
+#jxaS5lqmDtH2aL3dqNMCbW1AL6t3mUPjRjYT6RzoRf6tzNab27Qlug1i1J8wVMyhQJGudDKpdpHKRTaaKTObwCQ0BdY6DJoGYurl
+#t6KsmWZDa0eRVDIjjGHiAJ/StyGbnlCCjSoheXsmjOQqI9RCGE/nB03aSAOGU3zrHFV5etSGFZzFxm/gQ5Mhpg5Phq2WwQzQbj2Y
+#k3p/mPfhpxTarT1vjlrNL8djWTPDxxxDJx9ZtiGdnaDt+RRnlE7xHeQzDLktdn7s8YTCh3OoqVEaNaoda3fFYuuN+C7U04aEmcQU
+#S9yZCUrcmXQ+0mU4m5yZYm1BMltRo7QXfZI2oBhSh7PPZBqytrK8KENfIsVuQjV4llrGjfxA1tyZ2DczrTOT2GwWZ9A3okwQzSYm
+#elLUQ31GhhDsVeyBCRytgN5JKZIH0WaK3ZBLp8ox2nBNDXhmu4kPDB9ApSOhqyeVT+SLvdZpANYQoENBSCGctSJaslfYlE7v6iOE
+#9pDjXN18liOjfeq8F849aG3FVE3jTc9sUtmXQS95xjRvrKNK4pHZj95JRY0M49TkzmSSZU+YufXFbpP2+DCzJU41bjjab+7L87EW
+#9jgdxJGdwGgvD0NqntlnxMdxCOBwzVfFc5UR5aSKGRNuGjez5kVcBLqBrKVHOpsSVItM4EEFXXyUGXqNtliMC8ey0JsBDacEOl72
+#G3TYWWceix0pYFK3OVIYGyOVlGn2VFCmdOZy5sRIshilHenLZLKEgWw6Y2bzRdJGZYZpjS8nRXlbFtbZ3nR213RRzOymxOiomZpZ
+#+QZsgjXCZib2pnayZyDXnrwolxrShSzzlZMHzZ1D6IfyxUG0h1yFqDRn9CTNCZy7qH0VSUqlhtrVL2nsYyw3s0ZUz2ghnp+pXGvj
+#o9lknMgYqWKFdMqimJ5PjCSSOKTKqeqYMBzDaKYK7UmpuxptNCOwbRELDjCF87EW2O6J9B6yy2wCHeaHVRalI/bkFlr6FbIVp6Ow
+#KpcAOEz5xkMDq0MJcOAS0pegLWrTO/ORnn15M8V7SEa2pMfGKLF6wESsTqMU5EA/wmg0rZpA05WFVSyYgJcVXbmbEin2yooYs/wk
+#DNHmPhWM602suN/cq0i8kgPEx4G24mPx1d5rkADL/3UZyeQIOkxUHsMEo8UB09xVVouainBFY81RW2hZYySh+tfbmxMIWAzlPqxt
+#ITegPSjNWdMKa74U6YrixAxdXUN852kaeJNVNdOhApmfEaVQJQ1y9BcmYD1OOqaRgjWta2OxTQVsEtCJakNoYbAxa5qpis4sy2vF
+#2e2rXuFKbLzsO21Kn9qUCycZm4JdWDEk7b6O0smy5DUits2p5M54JRcOR2upo7xieenDHqd3LIWuD9U3msjbonWrw4CmJ6HHLW2+
+#VSE2OnTe/W02ySBG51OS+dHAs+2A2lJex3KMjrSzc/eb+QjNPbg8VROgnYDa3E0r6G1GtmTKnWhW2CnZiyyY0X3nY7ERK9JLowXv
+#bJwKtdtK00MmnSR/rgq2ltc4rMdwCW1mK9fcZEIlu6NdApmmOn8aFWd/spEsxPJ8s4ujdTlNIJWLdxqWNhrDoU53tdQCdQQ091jJ
+#wWQrOqGTtyWvXPtTYRWxSFxBvplZK++2gZyt3O6Egf2dyyfiuYtNl6qqXMTqxhx2wnAqsY/HgFpmAS9/LVz5vxlrNcsZzqSzi61e
+#tqlV8zQaS161emO2aaRZuiimRgZ7H+xhUm0ibqoCL5I0za3ac38pXU2zdIglnQMLw3maUHCdQ9WThfMcyBWUY+ROeMFxUUXTuiRS
+#mpVy5SVjrnKMDGTpSJHEHiqSbGtD0hhTvN18uDfafnsslh9PlHJFy7u6odW9az9Ta1SB5G5zoIZMefJ5xxkp0jmSy2fV6V65WZ67
+#ptmydY4ZU7vT8QKtEmxa357Mu9vkHly0TfcgkU1qO01ug41TQiVun0Fpkd6lHtZ0Duzhmys/+VmGaeyzo/QEgQ1Ol1LQOGkVZxmc
+#OmgdeDf/zjw+m+M6n22XeWJEKWehaDoVN/KAvZ7KR9NUOGzlQ7/QR5BSccmPC9i4mggr58YKalk/0I2ujhqzlc+ZAXsxszVreURc
+#GWRz+XKUHiMG+TB74rWwoRJGmuzisxS5C611Hrd0MJ3O2/HK7lUOQr0Nme3BvPyuBBvNp8ODdUq8vbSiHV7ttRXjynXbMZbJwlWO
+#goX15tanSWG2vrOWwiri6sgChfOznEKjaep6tcZAb8m1W8eqQh+u/+gRpnIaBN4Pw3rNpB6i8/H+9F5cKu1TQpWeM1VLytEhowi0
+#sb0yF37kZBYLpZYZiVSOcHy8yhYhnYn1ptCaDVrUqvlIPTNaq1X76aLKOQ3QyWQAsGwcUFjIwDXQgv/aYDmsggi0Wlcb0omyEmOt
+#9MKz/oPQDybsgwLk4BaAxnJsCy75UvSlX11bqQRY1A89MIBXP0ShF/+FsZYwdMEQllvOC5N/3QVpzJ5CUhwFyiFTHsYxRn/qMSEL
+#exgSNV2RNr2gMOxFfATvGTC4tCQ2IQxNMIZ4HstOwyjnTCI2xiIv5ViCa6B8ScxZ5NpynEb142SDHCShok0gD5U2zmkRgPfEmSc2
+#rR4Y3sjxMPJT2Vmuh/JWyxCukGwnYtmKNs5sERgz1R6G/bANDlilGlzWKMYWV+QjnmHkWTpDqwnm3Y/aPADN1J5Y9KK1EzdpOoX1
+#5K2S6F5AnjDrSMmuuKrrKTIvlj9vAEsyweB0qsVAfioFesKcbwTpShMmay+HbaSWjlVoyLBkGLdKt3WI5TdW1hvj9kFdjvVu0E9J
+#PSm+Yw9pWOe8uNV3ipbFtiS5Z+kXfpRi54txz1PeMeYDT6nEOpIvif8wl3+UqSQZxuoNy35ybNkkR9xqGXgyVqvAfyvSEqxjlDU4
+#jjHiL8npppoz1n0fchBvrMISwU9azCKFegLqy7WQ/BCsjNMYAydLU19t8eAuKG1py0DUkwRUZl5JVWdincqyqLaENWJRD/4sll3g
+#VCzjqhaWNYGDnUovWFbeUint7X0lnHqU0klD45bdKjvaD31c0gEexVGmRNnKlzHeZcXovpQp/RyvblOYW53h1quWREDMnzmGrrFq
+#PMA9aLC0Y9xLE2hJGWrZ/AyXRdaVwrJi3IYYKL3AwjBsZz1kLzK6qQa4KczjkvxA0hp5begsyasQd4FlVH6GtJDEdtDIoXKpJINL
+#JAnMipHWDDAURkeb4txqTOerxmN5NOc4jcZJmH2nPTpJ+4Y14hJqnC6Mc71JltIe8aPsBxKlfODkdjVRT2U4Jc56UR6zBW7FkgmD
+#xpux3zrZMpbBZsxdBFG3CfsuipMElmDYXqfS28wmwQhzZXmUxS2bibCFZFlbBo9lpfuk5W+z1J6mi1lmyWN7Slgd5cmy1cCSsn+m
+#WndjTpPHJ9muwSOfZGA9NF+sjhyP5gzrmdoBV02nzFKaeO3sH1z+YrT7Kzf8+P6uu754FhxhIXT0WsKJSDBI0QABJ8XnO11zQjeK
+#kM6RgAthaPKYuj3ndcs5od0iVAgVnGEpLp+rhzURCISmhD4nNOVElicDrUIKjlwBwSmP00tEO/UQRw/Z0ZMcPWlHj3D0iB09zdHT
+#rlYhsCyKTAUZzvEAzAlNfhblQN7Jp2WoIOc1CBRtqgk5SzdMuQKkA7MU3ExE/jBQAxrBpdrhCEMj6gMa6pBwi6zzurFZjdAoUD3S
+#CdLn8+lzgpP3iuDk10khjdAQ1kITvtDUyjIZQlOrkT/gAQ2lWx2Yf7nDLYJF2m+niHSvB6QMTfXgf6pJ+tyu0OWhQsDrDU5OYbqu
+#h6XEghsF6VTXNa/wsjSBy3VsVeAKCG3XvcKiYEOGUS3H/UDQjjmxwskp6dIws4a1c8uokwSW7MFeI2GlrGsQwlJPgFV5i69BlFXm
+#UmzcIsPOpeuKrJPwupvVFGrwuB2hBt0bmnyQyE7OkiA4+WDA7dB1Vu/kUfzPvXhUVx0wedRtpWChCanrV7t9oQXcmap9AcpKiG1n
+#uq5jmXUVLFShBw2ykboRtTBVDGiuRsBLaAABvPQr3R7Mp1dkqi4UdYWdixx1ZA9TH5XU5X5lSw2K9bIGaRmUqDaoK4TXW+IKskKx
+#lpIOsQN0blsg4J0TMoVCySBoZ7Hg5Hk32XPDFYB2iSTS2HFKXUpafkMEyLYJaWSGpR4ScPKLGNXcaBYgglOHvDQa8a5ud3vdwrZF
+#KqiV8rV63Ro3k1uKba6jpHZKap/rdushNuuXRECJF5p8Ff9jebKBhwZWGKCaiaWRzQJZva1SkuANrAFFCy52gyNAQXmIV+e7sb98
+#WOAvmMG+B1AOTEUNhKaOoK8JaKh/zEXDDSkBTriXvQneVWFTD7JVHaVREQj4w4LlwhJDk2/pNq7b1fgskRANLuWMD+qW7gJlcSkl
+#OHUs7PbqOAYnnw9OvmDLdw5x/K9UUc7RiqMXGYmB8k6+QKM10IAIF/UodgmKuvISt0sPLQhOXlDZVCmc4YLbKxEG28tltuuPXx+7
+#Pfi89xr9mf2Nb39z2Us36o8+WexofunzO6RLly4pXQHp8mmukI7XMF7b3ZaD0l3WCCSPZZuXdHmRZ0K66jwu2yMiYW7AVWXTSKIy
+#L3e4yA4tK3Vb3eu2DNDhQv0S+IXHZWsUM4XxWkAZL3gFWL9aASd/vEJzh0RH5iPER46HJw+UHcCL1ofScD8XQgdcfA/UhVElH8WZ
+#IDR5t40fQRwzSMUidRoH5CG8Yal6MUBDW9jsT1ZkPVmBn0ac3F6o4A1bYz/UoC0GHS+JVwAvn2MxyqgLa0vKK+jXEVF56U1ZI9Of
+#TpXeVkfHs+m9OaFb7YXrBcyL9PdE6T1bZyaz1HrPft2ettZIK5YQuKT0FzXr+w/6g5WHsoSJJSDAU/6DBfgEuAfNpGnQlk8U4c2H
+#I7SThgBnm0IdpGEnS7BEwNXlP2dM+0PBkqqPYmCZgMXvwFv9/Qr9CnP9O3DP9vXMklm+bYD1Aq77Dcqhb3OWVH8QASGlbAf9NcjB
+#rzFINQ42N6EsDmGd4J16mILd8w3uHr/KKvIynmcyfztFJfrV38jsv4uwsu0vJCibXvpTD5Xsst6UcErp2wu4RED99HfKMFdA42wv
+#pXE6gcC0V8tQL8Bb8aLGDn27b/4piL4BEp5+33gGpT+zrfw1FllAI6gfdXgKeN0EVaGhOgqDQ91DX2pYtv2BSxdtPul/8aWJt+6h
+#Hy9DS34i07JzpKV/S0t65NYWy/RaUmaejLNin+PM6AgMbepcvvL9YJWz5IBVDsna8S9fWPq+8Sdfaf7VE303F8r1Zu09aWcJo4XK
+#WAxHUHcy2WckUjCRo3faZmlz5bcXYhnTm/Q/FAQLMtfeZbeCTvpsnYVOgfaOvRlTTlXsX3tK0g9DtsEQPuptw14eRKwXtuLDUwzv
+#/bBB7boLJx0/+TdVjqgq83orRgNh2ra40M1c2/jBa4O19O/FxwJ6yUFhAeeiBxuDXz8lKx6tVHjcEebfZAwhPWu9TphZ0q8F8bSW
+#/rXjQxT92KYdvEin128T1mNXEVtkvXTAMMsbPljDeew6uvlRKM51Z6pkmy1vK7rtct5t1iN6OU9bxfvHVq4rgPy9pQfbFD82lyWc
+#WUcEH52S6rfNQF+xbkGOMc5Frcxg+0jSMaB3n8rku7mOrRY9YdVhy5j6D9Wl9DjAD4yjyEOvWN5Nj620Ap6WZ7pGKt6mQgfrrpNf
+#J5lY8oj1cuDieVS+/zcho37nfvC3cthGLfxvC7Ps/68IfErcf00d73b+x6r2Gfv/r1hRO//jtxL2e8PhK+n0LzrPs2QDVy4lsnUQ
+#DKXw4lxR1cnuzN4z0NMf7e0Nt4S7hpZzZsUyWv7Uhfisj45yYTqMrGgf7pxP8xGEds7wXnMkzKeTXRPOZBN7jHzFodB8xPfScDKx
+#h84s5D8bL2WkfEgwnQW4kz/SMkfD/DdJMxcJ29/eIS2DdVpVjxS56qRRSCFbNqKkjlufa6DIH+Sjz/aXNWMJQkcxTmscPhKEjZLE
+#6ZS5jL6AUBKrg6/pFGuqrtTA8GJcUu9NIXOySGoopgt8hCiulJsjVEWBPiKlwpsq6jWSCVy9snS3hA+ggLdYUlMLmVzuPx68V97i
+#PfCuJ7tEWrb1DA71bu3/b7Sx3/z8n9ZVq5bXxv9vI9TO/6mFWqiFWqiFWqiFWqiFWqiFWqiFWqiFWqiFWqiFWqiFWqiFWqiFWqiF
+#WqiFWqiFWqiFWqiFWqiFWqiFWqiFWvi/E/4dcxaDkQC4AQA=
+#__NEXUS_PAYLOAD_END__
