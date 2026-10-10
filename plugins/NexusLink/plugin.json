@@ -1,6 +1,6 @@
 {
   "name": "NexusLink",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "author": "NEPENTII / CS2Nexus",
   "description": "Connects every server to the CS2Nexus web panel: private !getcode login, live players, play sessions and finished matches. Configured per server by the launcher.",
   "commands": [
