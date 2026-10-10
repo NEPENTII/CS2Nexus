@@ -2930,7 +2930,7 @@ alerts_menu() {
 #  The panel files and the NexusLink plugin are built into this launcher.
 # =============================================================================
 readonly PANEL_UNIT="cs2nexus-panel"
-readonly PANEL_VERSION="1.3.2"
+readonly PANEL_VERSION="1.4.2"
 readonly PANEL_SETTINGS="$PANEL_DIR/data/settings.json"
 
 panel_installed() { [[ -f $PANEL_DIR/app/server.py && -f $PANEL_SETTINGS ]]; }
