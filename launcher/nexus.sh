@@ -1668,28 +1668,36 @@ start_server() {
     if ! is_running "$id"; then
         err "Server exited right after start. Run its launcher manually to see the error:"
         echo "  runuser -u $CS2_USER -- bash -c 'cd $gdir && ./cs2.sh -dedicated -console -port $S_PORT $maparg'"
+        notify_server_event fail_start "$id" || true
         return 1
     fi
     ok "'$S_NAME' started (port $S_PORT, session $sess)."
     echo "   Attach : runuser -u $CS2_USER -- tmux attach -t $sess   (detach: Ctrl+B then D)"
+    notify_server_event start "$id" || true
+    rm -f -- "$STATE_DIR/crash-notified-$id"
 }
 
 # Gracefully stop ONLY this server's tmux session
 stop_session() {
-    local id=$1 sess i
+    local id=$1 sess i was=0
     sess=$(session_name "$id")
     mark_manual_stop "$id"      # the watchdog must not restart an intentional stop
     is_running "$id" || return 0
+    was=1
 
     tmux_cs2 send-keys -t "=$sess:" "quit" Enter 2>/dev/null
     for ((i = 0; i < STOP_TIMEOUT; i++)); do
-        is_running "$id" || return 0
+        if ! is_running "$id"; then
+            ((was)) && notify_server_event stop "$id" || true
+            return 0
+        fi
         sleep 1
     done
     warn "Server did not quit gracefully; closing tmux session $sess."
     tmux_cs2 kill-session -t "=$sess" 2>/dev/null
     sleep 1
     if is_running "$id"; then err "Could not stop session $sess."; return 1; fi
+    ((was)) && notify_server_event stop "$id" || true
     return 0
 }
 
@@ -2480,10 +2488,18 @@ watchdog_run() {
         cnt=$(printf '%s' "$recent" | grep -c . || true)
         if ((cnt >= WATCHDOG_MAX_RESTARTS)); then
             warn "'$S_NAME' is offline but hit the restart limit ($WATCHDOG_MAX_RESTARTS per $((WATCHDOG_WINDOW / 60)) min); skipping."
+            if [[ ! -f $STATE_DIR/crash-notified-$id ]]; then
+                notify_server_event crash "$id" || true
+                : >"$STATE_DIR/crash-notified-$id"
+            fi
             continue
         fi
-        { [[ -n $recent ]] && printf '%s\n' "$recent"; printf '%s\n' "$now"; } >"$f"
+        { [[ -n $recent ]] && printf '%s
+' "$recent"; printf '%s
+' "$now"; } >"$f"
         info "Watchdog: '$S_NAME' is offline; starting it."
+        notify_server_event crash "$id" || true
+        rm -f -- "$STATE_DIR/crash-notified-$id"
         start_server "$id" || rc=1
     done
     unlock_ops
@@ -3225,8 +3241,91 @@ alert_send() {   # <text>   (never fails the caller)
     if [[ -n $tok && -n $chat ]]; then
         curl -fsS -m 10 "https://api.telegram.org/bot$tok/sendMessage" --data-urlencode "chat_id=$chat" --data-urlencode "text=$msg" >/dev/null 2>&1 || true
     fi
-    return 0
+    bale_send "$msg"
 }
+
+# ---------------- Bale bot (tapi.bale.ai — Telegram-compatible) ----------------
+bale_token() {
+    local t; t=$(fx_get BALE_TOKEN)
+    if [[ -z $t ]]; then t='1143887056:9XYOpu_Vg2-pQq9Qs98heRvjSrUc-SbW5ow'; fi
+    printf '%s' "$t"
+}
+bale_send() {   # <text>
+    local msg=$1 tok chat payload
+    command -v curl >/dev/null 2>&1 || return 0
+    tok=$(bale_token); chat=$(fx_get BALE_CHAT_ID)
+    [[ -n $tok && -n $chat ]] || return 0
+    payload=$(jq -nc --arg c "$chat" --arg t "$msg" '{chat_id:(try ($c|tonumber) catch $c), text:$t}') || return 0
+    curl -fsS -m 12 -H 'Content-Type: application/json' \
+        -d "$payload" "https://tapi.bale.ai/bot${tok}/sendMessage" >/dev/null 2>&1 || true
+}
+bale_discover_chat() {
+    local tok raw id
+    tok=$(bale_token); [[ -n $tok ]] || { err "Bale token is empty."; return 1; }
+    raw=$(curl -fsS -m 15 "https://tapi.bale.ai/bot${tok}/getUpdates?limit=20" 2>/dev/null) || { err "Could not reach Bale API."; return 1; }
+    id=$(printf '%s' "$raw" | jq -r '[.result[]? | .message.chat // .callback_query.message.chat // empty | select((.type=="private") or (.type==null) or (.type=="")) | .id] | last // empty' 2>/dev/null)
+    if [[ -z $id || $id == null ]]; then
+        err "No private chat found. Open the bot in Bale, send /start, then try again."
+        return 1
+    fi
+    fx_set BALE_CHAT_ID "$id"
+    ok "Bale chat id saved: $id"
+    bale_send "CS2NEXUS connected. You will get server start / stop / crash alerts here."
+}
+server_crash_snippet() {
+    local logf=${1:-} out
+    [[ -n $logf && -f $logf ]] || { printf '%s' "(no console log)"; return; }
+    out=$(tail -n 40 -- "$logf" 2>/dev/null | tr -cd '\11\12\15\40-\176\n' | tail -n 15)
+    out=$(printf '%s' "$out" | tail -c 1200)
+    [[ -n $out ]] && printf '%s' "$out" || printf '%s' "(empty log)"
+}
+notify_server_event() {   # <event> <id>   start|stop|crash|fail_start
+    local ev=$1 id=$2 name port snip msg
+    load_server "$id" 2>/dev/null || return 0
+    name=${S_NAME:-"#$id"}; port=${S_PORT:-?}
+    case $ev in
+        start)
+            msg="🟢 Server STARTED
+• Name: $name
+• ID: $id
+• Port: $port
+• Host: $(hostname)"
+            ;;
+        stop)
+            msg="⏹ Server STOPPED (manual)
+• Name: $name
+• ID: $id
+• Port: $port
+• Host: $(hostname)"
+            ;;
+        crash)
+            snip=$(server_crash_snippet "$S_PATH/logs/console.log")
+            msg="🔴 Server CRASHED / offline
+• Name: $name
+• ID: $id
+• Port: $port
+• Host: $(hostname)
+• Watchdog will restart if autostart is enabled
+
+Last console lines:
+$snip"
+            ;;
+        fail_start)
+            snip=$(server_crash_snippet "$S_PATH/logs/console.log")
+            msg="⚠️ Server FAILED TO STAY UP
+• Name: $name
+• ID: $id
+• Port: $port
+• Host: $(hostname)
+
+Last console lines:
+$snip"
+            ;;
+        *) return 0 ;;
+    esac
+    bale_send "$msg"
+}
+
 
 # one check (called every minute by the timer). A value must stay over its limit for ALERT_SUSTAIN
 # checks in a row before an alert is sent; the same alert repeats at most every ALERT_COOLDOWN minutes.
@@ -3344,7 +3443,11 @@ alerts_menu() {
         printf '  Also checks    : every running server (its share of the machine, same CPU/RAM limits)\n'
         printf '  Log file       : %s\n' "$AL_LOG"
         v=$(fx_get ALERT_WEBHOOK); printf '  Webhook        : %s\n' "${v:+set}${v:-not set}"
-        v=$(fx_get ALERT_TG_TOKEN); printf '  Telegram       : %s\n\n' "$([[ -n $v && -n $(fx_get ALERT_TG_CHAT) ]] && echo set || echo 'not set')"
+        v=$(fx_get ALERT_TG_TOKEN); printf '  Telegram       : %s
+' "$([[ -n $v && -n $(fx_get ALERT_TG_CHAT) ]] && echo set || echo 'not set')"
+        printf '  Bale           : token %s, chat %s
+
+' "$([[ -n $(bale_token) ]] && echo set || echo 'not set')" "$([[ -n $(fx_get BALE_CHAT_ID) ]] && echo set || echo 'not set — /start the bot')"
         echo "  1) Turn alerts ON / OFF"
         echo "  2) Change the limits (CPU, RAM, disk)"
         echo "  3) Change how long / how often"
@@ -3352,7 +3455,9 @@ alerts_menu() {
         echo "  5) Set Telegram (bot token + chat id)"
         echo "  6) Send a test alert"
         echo "  7) Show the alert log"
-        echo "  8) Back"
+        echo "  8) Bale: auto-detect chat id (open bot, send /start, then run this)"
+        echo "  9) Bale: set token / chat id manually"
+        echo "  b) Back"
         echo
         read -r -p "Select: " c || exit 0
         case "$(trim "$c")" in
@@ -3370,9 +3475,15 @@ alerts_menu() {
                    fx_set ALERT_TG_TOKEN "$v"; read -r -p "Chat id: " v || exit 0; v=$(trim "$v")
                    [[ $v =~ ^-?[0-9]+$ ]] && { fx_set ALERT_TG_CHAT "$v"; ok "Saved."; } || err "The chat id is a number."
                else err "That does not look like a bot token."; fi; pause ;;
-            6) alert_send "TEST: this is a test alert from CS2Nexus."; ok "Sent (log, journal$([[ -n $(fx_get ALERT_WEBHOOK) ]] && echo ', webhook')$([[ -n $(fx_get ALERT_TG_TOKEN) ]] && echo ', Telegram'))."; pause ;;
+            6) alert_send "TEST: this is a test alert from CS2Nexus."; ok "Sent (log, journal$([[ -n $(fx_get ALERT_WEBHOOK) ]] && echo ', webhook')$([[ -n $(fx_get ALERT_TG_TOKEN) ]] && echo ', Telegram')$([[ -n $(fx_get BALE_CHAT_ID) ]] && echo ', Bale'))."; pause ;;
             7) if [[ -s $AL_LOG ]]; then tail -n 30 "$AL_LOG"; else info "The log is empty."; fi; pause ;;
-            8|q|Q) return ;;
+            8) bale_discover_chat; pause ;;
+            9) read -r -p "Bale bot token (empty = keep default): " v || exit 0; v=$(trim "$v")
+               if [[ -n $v ]]; then fx_set BALE_TOKEN "$v"; ok "Token saved."; fi
+               read -r -p "Bale chat id (empty = skip): " v || exit 0; v=$(trim "$v")
+               if [[ -n $v ]]; then fx_set BALE_CHAT_ID "$v"; ok "Chat id saved."; fi
+               pause ;;
+            b|B|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -3383,7 +3494,7 @@ alerts_menu() {
 #  The panel files and the NexusLink plugin are built into this launcher.
 # =============================================================================
 readonly PANEL_UNIT="cs2nexus-panel"
-readonly PANEL_VERSION="2.2.5"
+readonly PANEL_VERSION="2.2.6"
 readonly PANEL_SETTINGS="$PANEL_DIR/data/settings.json"
 
 panel_installed() { [[ -f $PANEL_DIR/app/server/index.js && -f $PANEL_SETTINGS ]]; }
