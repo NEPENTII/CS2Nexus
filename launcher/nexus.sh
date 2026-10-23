@@ -3250,27 +3250,49 @@ bale_token() {
     if [[ -z $t ]]; then t='1143887056:9XYOpu_Vg2-pQq9Qs98heRvjSrUc-SbW5ow'; fi
     printf '%s' "$t"
 }
-bale_send() {   # <text>
+bale_chat_ids() {
+    # prints up to 2 unique chat ids (BALE_CHAT_ID + BALE_CHAT_ID2)
+    local a b
+    a=$(fx_get BALE_CHAT_ID); b=$(fx_get BALE_CHAT_ID2)
+    [[ -n $a ]] && printf '%s\n' "$a"
+    [[ -n $b && $b != "$a" ]] && printf '%s\n' "$b"
+}
+bale_send() {   # <text>  — sends to both configured chat ids
     local msg=$1 tok chat payload
     command -v curl >/dev/null 2>&1 || return 0
-    tok=$(bale_token); chat=$(fx_get BALE_CHAT_ID)
-    [[ -n $tok && -n $chat ]] || return 0
-    payload=$(jq -nc --arg c "$chat" --arg t "$msg" '{chat_id:(try ($c|tonumber) catch $c), text:$t}') || return 0
-    curl -fsS -m 12 -H 'Content-Type: application/json' \
-        -d "$payload" "https://tapi.bale.ai/bot${tok}/sendMessage" >/dev/null 2>&1 || true
+    tok=$(bale_token); [[ -n $tok ]] || return 0
+    while IFS= read -r chat; do
+        [[ -n $chat ]] || continue
+        payload=$(jq -nc --arg c "$chat" --arg t "$msg" '{chat_id:(try ($c|tonumber) catch $c), text:$t}') || continue
+        curl -fsS -m 12 -H 'Content-Type: application/json' \
+            -d "$payload" "https://tapi.bale.ai/bot${tok}/sendMessage" >/dev/null 2>&1 || true
+    done < <(bale_chat_ids)
 }
 bale_discover_chat() {
-    local tok raw id
+    local tok raw id slot
     tok=$(bale_token); [[ -n $tok ]] || { err "Bale token is empty."; return 1; }
-    raw=$(curl -fsS -m 15 "https://tapi.bale.ai/bot${tok}/getUpdates?limit=20" 2>/dev/null) || { err "Could not reach Bale API."; return 1; }
+    raw=$(curl -fsS -m 15 "https://tapi.bale.ai/bot${tok}/getUpdates?limit=30" 2>/dev/null) || { err "Could not reach Bale API."; return 1; }
     id=$(printf '%s' "$raw" | jq -r '[.result[]? | .message.chat // .callback_query.message.chat // empty | select((.type=="private") or (.type==null) or (.type=="")) | .id] | last // empty' 2>/dev/null)
     if [[ -z $id || $id == null ]]; then
         err "No private chat found. Open the bot in Bale, send /start, then try again."
         return 1
     fi
-    fx_set BALE_CHAT_ID "$id"
-    ok "Bale chat id saved: $id"
-    bale_send "CS2NEXUS connected. You will get server start / stop / crash alerts here."
+    # fill first empty slot, or replace chat1 if both full and same user re-runs
+    if [[ -z $(fx_get BALE_CHAT_ID) ]]; then
+        fx_set BALE_CHAT_ID "$id"; slot=1
+    elif [[ $(fx_get BALE_CHAT_ID) == "$id" ]]; then
+        slot=1; ok "Chat id 1 already set: $id"
+    elif [[ -z $(fx_get BALE_CHAT_ID2) ]]; then
+        fx_set BALE_CHAT_ID2 "$id"; slot=2
+    elif [[ $(fx_get BALE_CHAT_ID2) == "$id" ]]; then
+        slot=2; ok "Chat id 2 already set: $id"
+    else
+        # both slots used by others — ask which to overwrite is hard in non-interactive; default overwrite #2
+        fx_set BALE_CHAT_ID2 "$id"; slot=2
+        warn "Both slots were full; chat id 2 was replaced."
+    fi
+    ok "Bale chat id #$slot saved: $id"
+    bale_send "CS2NEXUS connected (chat #$slot). You will get server start / stop / crash alerts here."
 }
 server_crash_snippet() {
     local logf=${1:-} out
@@ -3443,11 +3465,8 @@ alerts_menu() {
         printf '  Also checks    : every running server (its share of the machine, same CPU/RAM limits)\n'
         printf '  Log file       : %s\n' "$AL_LOG"
         v=$(fx_get ALERT_WEBHOOK); printf '  Webhook        : %s\n' "${v:+set}${v:-not set}"
-        v=$(fx_get ALERT_TG_TOKEN); printf '  Telegram       : %s
-' "$([[ -n $v && -n $(fx_get ALERT_TG_CHAT) ]] && echo set || echo 'not set')"
-        printf '  Bale           : token %s, chat %s
-
-' "$([[ -n $(bale_token) ]] && echo set || echo 'not set')" "$([[ -n $(fx_get BALE_CHAT_ID) ]] && echo set || echo 'not set — /start the bot')"
+        v=$(fx_get ALERT_TG_TOKEN); printf '  Telegram       : %s\n' "$([[ -n $v && -n $(fx_get ALERT_TG_CHAT) ]] && echo set || echo 'not set')"
+        printf '  Bale           : token %s, chat1 %s, chat2 %s\n\n' "$([[ -n $(bale_token) ]] && echo set || echo 'not set')" "$([[ -n $(fx_get BALE_CHAT_ID) ]] && echo set || echo empty)" "$([[ -n $(fx_get BALE_CHAT_ID2) ]] && echo set || echo empty)"
         echo "  1) Turn alerts ON / OFF"
         echo "  2) Change the limits (CPU, RAM, disk)"
         echo "  3) Change how long / how often"
@@ -3475,13 +3494,17 @@ alerts_menu() {
                    fx_set ALERT_TG_TOKEN "$v"; read -r -p "Chat id: " v || exit 0; v=$(trim "$v")
                    [[ $v =~ ^-?[0-9]+$ ]] && { fx_set ALERT_TG_CHAT "$v"; ok "Saved."; } || err "The chat id is a number."
                else err "That does not look like a bot token."; fi; pause ;;
-            6) alert_send "TEST: this is a test alert from CS2Nexus."; ok "Sent (log, journal$([[ -n $(fx_get ALERT_WEBHOOK) ]] && echo ', webhook')$([[ -n $(fx_get ALERT_TG_TOKEN) ]] && echo ', Telegram')$([[ -n $(fx_get BALE_CHAT_ID) ]] && echo ', Bale'))."; pause ;;
+            6) alert_send "TEST: this is a test alert from CS2Nexus."; ok "Sent (log, journal$([[ -n $(fx_get ALERT_WEBHOOK) ]] && echo ', webhook')$([[ -n $(fx_get ALERT_TG_TOKEN) ]] && echo ', Telegram')$([[ -n $(fx_get BALE_CHAT_ID)$(fx_get BALE_CHAT_ID2) ]] && echo ', Bale'))."; pause ;;
             7) if [[ -s $AL_LOG ]]; then tail -n 30 "$AL_LOG"; else info "The log is empty."; fi; pause ;;
             8) bale_discover_chat; pause ;;
             9) read -r -p "Bale bot token (empty = keep default): " v || exit 0; v=$(trim "$v")
                if [[ -n $v ]]; then fx_set BALE_TOKEN "$v"; ok "Token saved."; fi
-               read -r -p "Bale chat id (empty = skip): " v || exit 0; v=$(trim "$v")
-               if [[ -n $v ]]; then fx_set BALE_CHAT_ID "$v"; ok "Chat id saved."; fi
+               read -r -p "Bale chat id #1 (empty = keep, - = clear): " v || exit 0; v=$(trim "$v")
+               if [[ $v == - ]]; then fx_set BALE_CHAT_ID ""; ok "Chat id #1 cleared.";
+               elif [[ -n $v ]]; then fx_set BALE_CHAT_ID "$v"; ok "Chat id #1 saved."; fi
+               read -r -p "Bale chat id #2 (empty = keep, - = clear): " v || exit 0; v=$(trim "$v")
+               if [[ $v == - ]]; then fx_set BALE_CHAT_ID2 ""; ok "Chat id #2 cleared.";
+               elif [[ -n $v ]]; then fx_set BALE_CHAT_ID2 "$v"; ok "Chat id #2 saved."; fi
                pause ;;
             b|B|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
@@ -3494,7 +3517,7 @@ alerts_menu() {
 #  The panel files and the NexusLink plugin are built into this launcher.
 # =============================================================================
 readonly PANEL_UNIT="cs2nexus-panel"
-readonly PANEL_VERSION="2.2.7"
+readonly PANEL_VERSION="2.2.6"
 readonly PANEL_SETTINGS="$PANEL_DIR/data/settings.json"
 
 panel_installed() { [[ -f $PANEL_DIR/app/server/index.js && -f $PANEL_SETTINGS ]]; }
