@@ -2275,7 +2275,12 @@ panel_update_run() {
     pu_status updating updating "$lb" "$rb"
     cmd=("$STEAMCMD" +force_install_dir "$BASE" +login anonymous +app_update "$STEAM_APPID" +quit)
     run_as_cs2 "${cmd[@]}" 7>&- 8>&- 9>&-; rc=$?
-    ((rc == 0)) && patch_gameinfo
+    if ((rc == 0)); then
+        patch_gameinfo
+        # After every CS2 game update: ensure Metamod line + refresh official CSS
+        info "Refreshing CounterStrikeSharp after CS2 update..."
+        css_update_run 1 || warn "CounterStrikeSharp refresh failed; servers will still start. Check Maintenance -> CSS updater."
+    fi
     pu_status starting starting "$lb" "$rb"
     ((${#running[@]})) && restart_ids "${running[@]}"
     lb2=$(pu_local_build)
@@ -2298,7 +2303,7 @@ update_cs2_ui() {
     echo
     warn "The shared base installation ($BASE) is updated for ALL servers."
     warn "Running servers are stopped, then started again after the update."
-    info "Metamod / CounterStrikeSharp are NOT touched. Check plugin compatibility afterwards."
+    info "After the game update, gameinfo.gi (Metamod) and official CounterStrikeSharp will be refreshed automatically."
     echo
     if ((${#running[@]})); then
         ask "Countdown before stopping, in seconds (0-600)" 60 || { info "Cancelled."; return; }
@@ -2332,6 +2337,9 @@ update_cs2_ui() {
     if ((rc == 0)); then
         ok "SteamCMD finished."
         patch_gameinfo
+        info "Refreshing CounterStrikeSharp (and ensuring Metamod gameinfo line)..."
+        # css_update_run manages its own stop/start for CSS targets; servers already stopped above
+        css_update_run 1 || warn "CounterStrikeSharp refresh failed; check Maintenance -> CSS updater."
     else
         err "SteamCMD failed (exit code $rc)."
     fi
@@ -2343,7 +2351,7 @@ update_cs2_ui() {
         fi
     fi
     unlock_ops
-    ((rc == 0)) && info "Reminder: verify that your Metamod / CounterStrikeSharp versions still match the new game build."
+    ((rc == 0)) && ok "CS2 + Metamod gameinfo + CounterStrikeSharp post-update steps finished."
 }
 
 # ----- scheduled restart (systemd transient timers) -----
@@ -2836,6 +2844,8 @@ css_update_run() {   # [quiet 0|1]
     fi
     if ((rc == 0)); then
         css_backup_prune
+        # CS2 updates often wipe the Metamod SearchPath; re-apply every time CSS is refreshed
+        patch_gameinfo || true
         ((quiet)) || ok "CounterStrikeSharp updated to $tag. Backup: $run"
     else
         ((quiet)) || err "CounterStrikeSharp update did not complete cleanly. Inspect server logs; backup: $run"
