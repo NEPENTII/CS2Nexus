@@ -2276,10 +2276,9 @@ panel_update_run() {
     cmd=("$STEAMCMD" +force_install_dir "$BASE" +login anonymous +app_update "$STEAM_APPID" +quit)
     run_as_cs2 "${cmd[@]}" 7>&- 8>&- 9>&-; rc=$?
     if ((rc == 0)); then
-        patch_gameinfo
-        # After every CS2 game update: ensure Metamod line + refresh official CSS
-        info "Refreshing CounterStrikeSharp after CS2 update..."
-        css_update_run 1 || warn "CounterStrikeSharp refresh failed; servers will still start. Check Maintenance -> CSS updater."
+        # After every CS2 game update: full Metamod + CSS + gameinfo repair
+        info "Running full Metamod + CounterStrikeSharp repair after CS2 update..."
+        repair_metamod_css 1 1 || warn "Metamod/CSS repair had issues; servers will still start. Check Maintenance -> Repair Metamod/CSS."
     fi
     pu_status starting starting "$lb" "$rb"
     ((${#running[@]})) && restart_ids "${running[@]}"
@@ -2336,10 +2335,9 @@ update_cs2_ui() {
     rc=$?
     if ((rc == 0)); then
         ok "SteamCMD finished."
-        patch_gameinfo
-        info "Refreshing CounterStrikeSharp (and ensuring Metamod gameinfo line)..."
-        # css_update_run manages its own stop/start for CSS targets; servers already stopped above
-        css_update_run 1 || warn "CounterStrikeSharp refresh failed; check Maintenance -> CSS updater."
+        info "Running full Metamod + CounterStrikeSharp repair after CS2 update..."
+        # repair manages CSS stop/start; servers already stopped above for game update
+        repair_metamod_css 1 1 || warn "Metamod/CSS repair had issues; check Maintenance -> Repair Metamod/CSS."
     else
         err "SteamCMD failed (exit code $rc)."
     fi
@@ -2909,14 +2907,16 @@ css_updater_menu() {
     echo "  1) Check and install latest official release now"
     echo "  2) $( ((enabled)) && echo 'Disable' || echo 'Enable') periodic auto-update"
     echo "  3) Roll back to the latest saved backup"
-    echo "  4) Back"
+    echo "  4) Full repair (Metamod + CSS + gameinfo, force reinstall)"
+    echo "  5) Back"
     echo
     read -r -p "Select: " c || return
     case "$(trim "$c")" in
         1) css_update_run 0; pause ;;
         2) if ((enabled)); then css_autoupdate_disable; else css_autoupdate_enable; fi; pause ;;
         3) css_rollback_latest; pause ;;
-        4|q|Q) return ;;
+        4) repair_metamod_css 0 1; pause ;;
+        5|q|Q) return ;;
         *) err "Invalid option."; sleep 1 ;;
     esac
 }
@@ -2938,7 +2938,8 @@ maintenance_menu() {
         echo "7) Update launcher"
         echo "8) Launcher settings"
         echo "9) CounterStrikeSharp updater (official / auto-update / rollback)"
-        echo "10) Back"
+        echo "10) Repair Metamod + CSS fully (auto fix after CS2 update / crash)"
+        echo "11) Back"
         echo
         read -r -p "Select: " c || exit 0
         case "$(trim "$c")" in
@@ -2951,7 +2952,8 @@ maintenance_menu() {
             7) update_launcher_ui; pause ;;
             8) launcher_settings_ui ;;
             9) css_updater_menu ;;
-            10|q|Q) return ;;
+            10) repair_metamod_css 0 1; pause ;;
+            11|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -4920,21 +4922,187 @@ install_cs2_files() {   # <dir>
 
 # Metamod needs one line in gameinfo.gi; game updates overwrite it, so this is
 # re-applied after every update (idempotent).
-patch_gameinfo() {
-    local gi
-    need_layout || return 1
-    gi="$BASE/$CSGOREL/gameinfo.gi"
+# Patch one gameinfo.gi file so Metamod loads. Returns 0 if already ok or patched.
+_patch_one_gameinfo() {
+    local gi=$1
     [[ -f $gi ]] || return 0
-    [[ -d $BASE/$CSGOREL/addons/metamod ]] || return 0
     if grep -q 'csgo/addons/metamod' "$gi"; then return 0; fi
     if sed -i '0,/^[[:space:]]*Game[[:space:]]\+csgo[[:space:]]*$/s//\t\t\tGame\tcsgo\/addons\/metamod\n&/' "$gi" \
         && grep -q 'csgo/addons/metamod' "$gi"; then
-        chown "$CS2_USER:$CS2_GROUP" -- "$gi" 2>/dev/null
-        ok "gameinfo.gi patched so Metamod loads."
-    else
-        warn "Could not patch $gi; add the line 'Game csgo/addons/metamod' above 'Game csgo' manually."
-        return 1
+        chown "$CS2_USER:$CS2_GROUP" -- "$gi" 2>/dev/null || true
+        return 0
     fi
+    return 1
+}
+
+# Patch base + every registered server that has its own gameinfo.gi
+patch_gameinfo() {
+    local gi id srv rc=0 n=0
+    need_layout || return 1
+    # Base tree
+    if [[ -d $BASE/$CSGOREL/addons/metamod ]]; then
+        gi="$BASE/$CSGOREL/gameinfo.gi"
+        if [[ -f $gi ]]; then
+            if _patch_one_gameinfo "$gi"; then
+                ((n++)) || true
+            else
+                warn "Could not patch $gi; add 'Game csgo/addons/metamod' above 'Game csgo' manually."
+                rc=1
+            fi
+        fi
+    fi
+    # Per-server trees (independent copies only; skip pure symlinks to base)
+    while IFS= read -r id; do
+        [[ $id =~ ^[0-9]+$ ]] || continue
+        load_server "$id" 2>/dev/null || continue
+        safe_server_path "$S_PATH" "$S_SLUG" 2>/dev/null || continue
+        [[ -d $S_PATH/$CSGOREL/addons/metamod ]] || continue
+        gi="$S_PATH/$CSGOREL/gameinfo.gi"
+        [[ -f $gi && ! -L $gi ]] || continue
+        if _patch_one_gameinfo "$gi"; then
+            ((n++)) || true
+        else
+            warn "Could not patch $gi (server $id)."
+            rc=1
+        fi
+    done < <(jq -r '.[].id' "$DB" 2>/dev/null)
+    if ((n > 0)); then
+        ok "gameinfo.gi Metamod line verified/patched ($n file(s))."
+    fi
+    return $rc
+}
+
+# Ensure counterstrikesharp is listed in metaplugins.ini (base + servers)
+ensure_css_metaplugin() {
+    local ini id
+    need_layout || return 0
+    for ini in "$BASE/$CSGOREL/addons/metamod/metaplugins.ini"; do
+        [[ -f $ini ]] || continue
+        if ! grep -qiE 'addons/counterstrikesharp|counterstrikesharp' "$ini" 2>/dev/null; then
+            printf '\naddons/counterstrikesharp/bin/linuxsteamrt64/counterstrikesharp\n' >>"$ini"
+            chown "$CS2_USER:$CS2_GROUP" -- "$ini" 2>/dev/null || true
+            ok "Added CounterStrikeSharp to $ini"
+        fi
+    done
+    while IFS= read -r id; do
+        [[ $id =~ ^[0-9]+$ ]] || continue
+        load_server "$id" 2>/dev/null || continue
+        safe_server_path "$S_PATH" "$S_SLUG" 2>/dev/null || continue
+        ini="$S_PATH/$CSGOREL/addons/metamod/metaplugins.ini"
+        [[ -f $ini && ! -L $ini ]] || continue
+        if ! grep -qiE 'addons/counterstrikesharp|counterstrikesharp' "$ini" 2>/dev/null; then
+            printf '\naddons/counterstrikesharp/bin/linuxsteamrt64/counterstrikesharp\n' >>"$ini"
+            chown "$CS2_USER:$CS2_GROUP" -- "$ini" 2>/dev/null || true
+        fi
+    done < <(jq -r '.[].id' "$DB" 2>/dev/null)
+    return 0
+}
+
+# Download / refresh Metamod:Source into the base tree (plugins folder preserved)
+update_metamod() {
+    local csgo tmp name
+    need_layout || return 1
+    csgo="$BASE/$CSGOREL"
+    tmp=$(mktemp -d /tmp/cs2nexus-mm.XXXXXX) || return 1
+    info "Updating Metamod:Source from $MM_DROP ..."
+    name=$(curl -fsSL -m 30 "$MM_DROP/mmsource-latest-linux" 2>/dev/null) && name=$(trim "$name")
+    if [[ ! $name =~ ^mmsource-[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
+        err "Could not resolve latest Metamod filename from $MM_DROP"
+        rm -rf --one-file-system -- "$tmp"; return 1
+    fi
+    if ! curl -fsSL -m 300 -o "$tmp/mm.tgz" "$MM_DROP/$name"; then
+        err "Metamod download failed ($name)."
+        rm -rf --one-file-system -- "$tmp"; return 1
+    fi
+    # Extract into a staging dir, then overlay without wiping user plugins
+    mkdir -p -- "$tmp/extract"
+    if ! tar -xzf "$tmp/mm.tgz" -C "$tmp/extract" --no-same-owner; then
+        err "Metamod archive extract failed."
+        rm -rf --one-file-system -- "$tmp"; return 1
+    fi
+    # Official layout: extract produces addons/metamod under csgo-relative root
+    if [[ -d $tmp/extract/addons/metamod ]]; then
+        mkdir -p -- "$csgo/addons"
+        # Keep existing plugins/ folder if present
+        if [[ -d $csgo/addons/metamod/plugins ]]; then
+            cp -a -- "$csgo/addons/metamod/plugins" "$tmp/mm-plugins.bak" 2>/dev/null || true
+        fi
+        cp -a -- "$tmp/extract/addons/metamod/." "$csgo/addons/metamod/"
+        if [[ -d $tmp/mm-plugins.bak ]]; then
+            mkdir -p -- "$csgo/addons/metamod/plugins"
+            cp -a -- "$tmp/mm-plugins.bak/." "$csgo/addons/metamod/plugins/" 2>/dev/null || true
+        fi
+    else
+        # Fallback: extract directly into csgo (same as install_metamod_css)
+        tar -xzf "$tmp/mm.tgz" -C "$csgo" --no-same-owner || {
+            err "Metamod install failed."; rm -rf --one-file-system -- "$tmp"; return 1
+        }
+    fi
+    chown -R -P -h "$CS2_USER:$CS2_GROUP" -- "$csgo/addons/metamod" 2>/dev/null || true
+    rm -rf --one-file-system -- "$tmp"
+    ok "Metamod:Source updated ($name)."
+    return 0
+}
+
+# Full automatic repair: Metamod + gameinfo + CSS core + metaplugins + optional restart
+# Usage: repair_metamod_css [quiet 0|1] [force_css 0|1]
+# force_css=1 reinstalls CSS even if version tag already matches
+repair_metamod_css() {
+    local quiet=${1:-0} force_css=${2:-1} rc=0
+    local -a running=() ids
+    local id had_lock=0
+
+    if lock_ops 0; then
+        had_lock=1
+    else
+        ((quiet)) || warn "Manager busy; repair will still try CSS/Metamod steps where possible."
+    fi
+
+    need_layout || { ((had_lock)) && unlock_ops; return 1; }
+
+    ((quiet)) || info "=== Full Metamod + CounterStrikeSharp repair ==="
+
+    # 1) Metamod
+    if ! update_metamod; then
+        ((quiet)) || warn "Metamod update failed; continuing with CSS / gameinfo."
+        rc=1
+    fi
+
+    # 2) gameinfo on all trees
+    patch_gameinfo || rc=1
+
+    # 3) CSS: force reinstall by clearing state file when force_css=1
+    if ((force_css)); then
+        rm -f -- "$CSS_STATE_FILE" 2>/dev/null || true
+    fi
+    # If CSS not present at all, install from scratch
+    if [[ ! -d $BASE/$CSGOREL/addons/counterstrikesharp ]]; then
+        ((quiet)) || info "CounterStrikeSharp missing; running full install..."
+        install_metamod_css || rc=1
+    else
+        # css_update_run takes its own lock — release ours first to avoid deadlock
+        ((had_lock)) && unlock_ops
+        had_lock=0
+        if ! css_update_run "$quiet"; then
+            ((quiet)) || warn "CounterStrikeSharp update reported a problem."
+            rc=1
+        fi
+    fi
+
+    # 4) metaplugins entry
+    ensure_css_metaplugin || true
+
+    # 5) gameinfo again (CSS install can run after SteamCMD-like paths)
+    patch_gameinfo || true
+
+    ((quiet)) || {
+        if ((rc == 0)); then
+            ok "Metamod + CounterStrikeSharp repair finished. Restart servers if they were already running."
+        else
+            warn "Repair finished with some warnings. Check logs and Maintenance -> CSS updater."
+        fi
+    }
+    return $rc
 }
 
 css_asset_url() {
@@ -7674,6 +7842,7 @@ cli_main() {
         watchdog)  preflight cli; watchdog_run ;;
         plugin-update) preflight cli; plugins_update_run 1 ;;
         css-update) preflight cli; css_update_run 1 ;;
+        repair-mm-css|repair-css) preflight cli; repair_metamod_css 1 1 ;;
         backup)    preflight cli; backup_run auto ;;
         alert-check) preflight cli; alert_check ;;
         panel-export) preflight cli; panel_export_servers ;;
