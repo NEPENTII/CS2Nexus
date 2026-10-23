@@ -57,6 +57,10 @@ STEAMCMD="/usr/games/steamcmd"
 readonly SETTINGS_DB="$SERVERS_DIR/shared/server-settings.json"
 readonly PLUGIN_BACKUP_DIR="$SERVERS_DIR/shared/backups/plugins"
 readonly PLUGIN_TIMER_UNIT="cs2nexus-plugin-update"
+readonly CSS_TIMER_UNIT="cs2nexus-css-update"
+readonly CSS_BACKUP_DIR="$SHARED_DIR/backups/counterstrikesharp"
+readonly CSS_STATE_FILE="$STATE_DIR/counterstrikesharp-version"
+readonly CSS_BACKUP_KEEP=5
 readonly PLUGIN_BACKUP_KEEP=5
 # Online sources (overridable for testing through environment variables)
 GH_API="${CS2NEXUS_API:-https://api.github.com}"
@@ -67,6 +71,7 @@ NEXUS_BRANCH="main"
 EXTRA_PLUGIN_REPOS="Ayrton09/AstraSkins"
 GITHUB_TOKEN=""
 AUTOUPDATE=0
+CSS_AUTOUPDATE=1
 UPDATE_ACTION="none"        # none | reload : what to do on running servers after a plugin update
 SETTINGS_DEFAULT_JSON='[{"id":0,"cvars":{},"features":{"team_balance":"off","force_pick_time":"off"},"launch":{"maxplayers":13,"map":"de_dust2","game_type":0,"game_mode":1},"custom":[],"plugins":{"mode":"all","local":[]}}]'
 PREFLIGHT_MODE=menu
@@ -312,6 +317,11 @@ preflight() {
         else
             err "CS2 server files not found in $BASE."; exit 1
         fi
+    fi
+    # CSS auto-updater is enabled by default. The timer is local to the launcher,
+    # and its service only updates official CounterStrikeSharp files.
+    if [[ $mode == menu && ${CSS_AUTOUPDATE:-1} == 1 ]]; then
+        css_autoupdate_enable quiet || warn "CounterStrikeSharp auto-update timer could not be installed; open Maintenance -> CounterStrikeSharp updater."
     fi
 }
 
@@ -2589,6 +2599,318 @@ backups_ui() {
     echo "  jq -e 'type==\"array\"' <restored-file>"
 }
 
+# =============================================================================
+#  OFFICIAL COUNTERSTRIKESHARP AUTO-UPDATER
+#  Source: https://github.com/roflmuffin/CounterStrikeSharp/releases
+#  Only overlays the CounterStrikeSharp directory; Metamod is never touched.
+# =============================================================================
+css_latest_release() {
+    local json=$1
+    curl -fsSL --connect-timeout 15 --max-time 45 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        'https://api.github.com/repos/roflmuffin/CounterStrikeSharp/releases/latest' -o "$json" || return 1
+    jq -e '(.tag_name | type == "string") and (.assets | type == "array")' "$json" >/dev/null 2>&1
+}
+
+css_targets_collect() {
+    CSS_TARGET_PATHS=(); CSS_TARGET_KEYS=(); CSS_TARGET_IDS=()
+    local target id
+    need_layout || return 1
+    target="$BASE/$CSGOREL/addons/counterstrikesharp"
+    if [[ -d $target && ! -L $target ]]; then
+        CSS_TARGET_PATHS+=("$target"); CSS_TARGET_KEYS+=(base); CSS_TARGET_IDS+=(0)
+    fi
+    while IFS= read -r id; do
+        [[ $id =~ ^[0-9]+$ ]] || continue
+        load_server "$id" || continue
+        safe_server_path "$S_PATH" "$S_SLUG" || continue
+        target="$S_PATH/$CSGOREL/addons/counterstrikesharp"
+        [[ -d $target && ! -L $target ]] || continue
+        CSS_TARGET_PATHS+=("$target"); CSS_TARGET_KEYS+=("server-$id"); CSS_TARGET_IDS+=("$id")
+    done < <(jq -r '.[].id' "$DB" 2>/dev/null)
+    ((${#CSS_TARGET_PATHS[@]} > 0))
+}
+
+css_detect_installed_version() {   # prints a common 1.0.xxx version only if every target agrees
+    local target found first="" mixed=0
+    command -v strings >/dev/null 2>&1 || return 1
+    for target in "${CSS_TARGET_PATHS[@]}"; do
+        found=$(strings -a "$target/api/CounterStrikeSharp.API.dll" 2>/dev/null | grep -Eo '1\.0\.[0-9]+' | sort -Vu | tail -1)
+        [[ -n $found ]] || return 1
+        if [[ -z $first ]]; then first=$found; elif [[ $found != "$first" ]]; then mixed=1; fi
+    done
+    ((mixed == 0)) && [[ -n $first ]] || return 1
+    printf '%s\n' "$first"
+}
+
+css_backup_prune() {
+    [[ -d $CSS_BACKUP_DIR ]] || return 0
+    local -a runs=()
+    mapfile -t runs < <(find "$CSS_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%f\n' 2>/dev/null | sort -r)
+    local i
+    for ((i=CSS_BACKUP_KEEP; i<${#runs[@]}; i++)); do
+        rm -rf --one-file-system -- "$CSS_BACKUP_DIR/${runs[$i]}"
+    done
+}
+
+css_backup_target() {   # <run-dir> <index>
+    local run=$1 i=$2 key=${CSS_TARGET_KEYS[$2]} target=${CSS_TARGET_PATHS[$2]}
+    local dest="$run/$key/counterstrikesharp"
+    install -d -m 750 -- "$(dirname -- "$dest")" || return 1
+    cp -a -- "$target" "$dest" || return 1
+    printf '%s\n' "$target" >"$run/$key/target-path.txt"
+    printf '%s\n' "${CSS_TARGET_IDS[$i]}" >"$run/$key/server-id.txt"
+}
+
+css_restore_run() {   # <run-dir> ; restore every backed-up target
+    local run=$1 item target backup id rc=0
+    [[ -d $run ]] || { err "Backup run not found: $run"; return 1; }
+    while IFS= read -r -d '' item; do
+        target=$(cat "$item/target-path.txt" 2>/dev/null) || { rc=1; continue; }
+        backup="$item/counterstrikesharp"
+        [[ -d $backup && -d $target && ! -L $target ]] || { err "Unsafe or incomplete rollback target: $target"; rc=1; continue; }
+        case "$target" in "$BASE"/*|"$SERVERS_DIR"/*) ;; *) err "Rollback path is outside managed directories: $target"; rc=1; continue ;; esac
+        local parent name restore_tmp
+        parent=${target%/*}; name=${target##*/}; restore_tmp="$parent/.${name}.rollback.$$"
+        rm -rf --one-file-system -- "$restore_tmp"
+        cp -a -- "$backup" "$restore_tmp" || { rc=1; continue; }
+        rm -rf --one-file-system -- "$target" || { rm -rf --one-file-system -- "$restore_tmp"; rc=1; continue; }
+        mv -- "$restore_tmp" "$target" || { rc=1; continue; }
+        chown -R -P -h "$CS2_USER:$CS2_GROUP" -- "$target" 2>/dev/null || true
+        id=$(cat "$item/server-id.txt" 2>/dev/null || echo 0)
+        info "Restored CounterStrikeSharp files for ${id/0/base} from backup."
+    done < <(find "$run" -mindepth 1 -maxdepth 1 -type d -print0)
+    if [[ -f $run/previous-version.txt ]]; then
+        local previous_version
+        previous_version=$(cat "$run/previous-version.txt" 2>/dev/null || true)
+        if [[ -n $previous_version ]]; then
+            printf '%s\n' "$previous_version" >"$CSS_STATE_FILE.tmp" && chmod 644 "$CSS_STATE_FILE.tmp" && mv -f -- "$CSS_STATE_FILE.tmp" "$CSS_STATE_FILE"
+        else
+            rm -f -- "$CSS_STATE_FILE"
+        fi
+    fi
+    return "$rc"
+}
+
+css_rollback_latest() {
+    local latest
+    need_layout || return 1
+    [[ -d $CSS_BACKUP_DIR ]] || { err "No CounterStrikeSharp backups exist yet."; return 1; }
+    latest=$(find "$CSS_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%p\n' 2>/dev/null | sort -r | head -1)
+    [[ -n $latest ]] || { err "No CounterStrikeSharp backups exist yet."; return 1; }
+    info "Rollback source: $latest"
+    confirm_yn "Restore the previous CounterStrikeSharp files from this backup? [y/N]: " n || return 1
+    lock_ops 60 || { err "Another manager operation is running."; return 1; }
+    local id rc=0
+    local -a running=()
+    while IFS= read -r id; do
+        [[ $id =~ ^[0-9]+$ ]] || continue
+        load_server "$id" || continue
+        if is_running "$id" && [[ -d $S_PATH/$CSGOREL/addons/counterstrikesharp ]]; then running+=("$id"); fi
+    done < <(jq -r '.[].id' "$DB")
+    if ((${#running[@]})); then
+        broadcast_cmd "say [CS2NEXUS] CounterStrikeSharp rollback maintenance; server restarting shortly."
+        for id in "${running[@]}"; do stop_session "$id" || rc=1; done
+    fi
+    if ((rc == 0)); then css_restore_run "$latest" || rc=1; fi
+    for id in "${running[@]}"; do load_server "$id" && start_server "$id" || rc=1; done
+    unlock_ops
+    if ((rc == 0)); then ok "CounterStrikeSharp rollback completed. Backup kept at $latest"; else err "Rollback completed with errors; inspect server logs and $latest"; fi
+    return "$rc"
+}
+
+css_update_run() {   # [quiet 0|1]
+    local quiet=${1:-0} tmpdir json tag asset_url asset_name archive stage css_src current run i id rc=0 stop_failed=0
+    local -a running=() updated_ids=()
+    local -a CSS_TARGET_PATHS=() CSS_TARGET_KEYS=() CSS_TARGET_IDS=()
+    if ! lock_ops 0; then ((quiet)) || warn "Manager busy; CounterStrikeSharp update skipped."; return 1; fi
+    if ! css_targets_collect; then
+        ((quiet)) || info "CounterStrikeSharp is not installed in the base or any registered server; nothing to update."
+        unlock_ops; return 0
+    fi
+    tmpdir=$(mktemp -d /tmp/cs2nexus-css-update.XXXXXX) || { unlock_ops; return 1; }
+    json="$tmpdir/release.json"
+    if ! css_latest_release "$json"; then
+        ((quiet)) || err "Could not query the official CounterStrikeSharp GitHub release API."
+        rm -rf --one-file-system -- "$tmpdir"; unlock_ops; return 1
+    fi
+    tag=$(jq -r '.tag_name' "$json")
+    asset_name=$(jq -r '[.assets[] | select((.name | test("linux";"i")) and (.name | test("with-runtime";"i")) and (.name | endswith(".zip")))] | first | .name // empty' "$json")
+    asset_url=$(jq -r --arg n "$asset_name" '.assets[] | select(.name == $n) | .browser_download_url' "$json")
+    if [[ -z $tag || -z $asset_name || $asset_url != https://github.com/roflmuffin/CounterStrikeSharp/releases/download/* ]]; then
+        ((quiet)) || err "The official release did not contain a recognized Linux with-runtime ZIP asset."
+        rm -rf --one-file-system -- "$tmpdir"; unlock_ops; return 1
+    fi
+    current=$(cat "$CSS_STATE_FILE" 2>/dev/null || true)
+    if [[ -z $current ]]; then
+        local detected_version
+        detected_version=$(css_detect_installed_version 2>/dev/null || true)
+        [[ -n $detected_version ]] && current="v$detected_version"
+    fi
+    if [[ $current == "$tag" ]]; then
+        printf '%s\n' "$tag" >"$CSS_STATE_FILE.tmp" && chmod 644 "$CSS_STATE_FILE.tmp" && mv -f -- "$CSS_STATE_FILE.tmp" "$CSS_STATE_FILE"
+        ((quiet)) || ok "CounterStrikeSharp is up to date ($tag)."
+        rm -rf --one-file-system -- "$tmpdir"; unlock_ops; return 0
+    fi
+    ((quiet)) || info "Official CounterStrikeSharp update found: ${current:-not yet tracked} -> $tag"
+    archive="$tmpdir/$asset_name"
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 600 "$asset_url" -o "$archive"; then
+        ((quiet)) || err "Download failed; installed files were not changed."
+        rm -rf --one-file-system -- "$tmpdir"; unlock_ops; return 1
+    fi
+    stage="$tmpdir/extracted"; mkdir -p -- "$stage"
+    if ! unzip -q "$archive" -d "$stage"; then
+        ((quiet)) || err "Downloaded ZIP could not be extracted; installed files were not changed."
+        rm -rf --one-file-system -- "$tmpdir"; unlock_ops; return 1
+    fi
+    css_src=$(find "$stage" -type d -path '*/addons/counterstrikesharp' -print -quit 2>/dev/null)
+    if [[ -z $css_src || ! -f $css_src/api/CounterStrikeSharp.API.dll || ! -d $css_src/bin ]]; then
+        ((quiet)) || err "The official package structure was not recognized; installed files were not changed."
+        rm -rf --one-file-system -- "$tmpdir"; unlock_ops; return 1
+    fi
+    # The official installer overlays files rather than deleting old ones. Remove
+    # protected directories from the STAGING copy so user configs, databases and
+    # plugin directories cannot be overwritten by the release archive.
+    rm -rf --one-file-system -- "$css_src/plugins" "$css_src/configs" "$css_src/data"
+
+    # Stop only servers that are currently running and have their own CSS core directory.
+    for i in "${!CSS_TARGET_IDS[@]}"; do
+        id=${CSS_TARGET_IDS[$i]}
+        ((id > 0)) || continue
+        if is_running "$id"; then running+=("$id"); fi
+    done
+    if ((${#running[@]})); then
+        ((quiet)) || info "Stopping ${#running[@]} running server(s) for the CounterStrikeSharp update..."
+        broadcast_cmd "say [CS2NEXUS] CounterStrikeSharp update maintenance in 30 seconds."
+        sleep 20
+        broadcast_cmd "say [CS2NEXUS] Restarting in 10 seconds for an official framework update."
+        sleep 10
+        for id in "${running[@]}"; do
+            if ! stop_session "$id"; then stop_failed=1; break; fi
+        done
+    fi
+    if ((stop_failed)); then
+        for id in "${running[@]}"; do load_server "$id" && ! is_running "$id" && start_server "$id" || true; done
+        ((quiet)) || err "Could not stop all servers; update cancelled."
+        rm -rf --one-file-system -- "$tmpdir"; unlock_ops; return 1
+    fi
+
+    run="$CSS_BACKUP_DIR/$(date +%Y%m%d-%H%M%S)"
+    install -d -m 750 -- "$run" || rc=1
+    if ((rc == 0)); then
+        printf '%s\n' "$current" >"$run/previous-version.txt" || rc=1
+    fi
+    if ((rc == 0)); then
+        for i in "${!CSS_TARGET_PATHS[@]}"; do
+            if ! css_backup_target "$run" "$i"; then rc=1; break; fi
+        done
+    fi
+    # Overlay only CounterStrikeSharp core files. No deletion/replacement of addons,
+    # Metamod, plugin directories, configs or plugin databases takes place.
+    if ((rc == 0)); then
+        for i in "${!CSS_TARGET_PATHS[@]}"; do
+            local target=${CSS_TARGET_PATHS[$i]}
+            if ! cp -a -- "$css_src/." "$target/"; then rc=1; break; fi
+            chown -R -P -h "$CS2_USER:$CS2_GROUP" -- "$target" 2>/dev/null || true
+            [[ -f $target/api/CounterStrikeSharp.API.dll && -d $target/bin ]] || { rc=1; break; }
+        done
+    fi
+    if ((rc != 0)); then
+        ((quiet)) || err "Update failed; restoring all CounterStrikeSharp backups."
+        css_restore_run "$run" || true
+    else
+        printf '%s\n' "$tag" >"$CSS_STATE_FILE.tmp" && chmod 644 "$CSS_STATE_FILE.tmp" && mv -f -- "$CSS_STATE_FILE.tmp" "$CSS_STATE_FILE" || rc=1
+    fi
+
+    # Bring back only servers that were online before maintenance.
+    for id in "${running[@]}"; do
+        if load_server "$id" && ! start_server "$id"; then rc=1; fi
+    done
+    # If a restart fails after installation, revert all updated CSS cores and retry starts.
+    if ((rc != 0)) && [[ -d $run ]]; then
+        ((quiet)) || err "Post-update validation failed; rolling back to the pre-update backup."
+        for id in "${running[@]}"; do load_server "$id" && is_running "$id" && stop_session "$id" || true; done
+        css_restore_run "$run" || true
+        for id in "${running[@]}"; do load_server "$id" && ! is_running "$id" && start_server "$id" || true; done
+    fi
+    if ((rc == 0)); then
+        css_backup_prune
+        ((quiet)) || ok "CounterStrikeSharp updated to $tag. Backup: $run"
+    else
+        ((quiet)) || err "CounterStrikeSharp update did not complete cleanly. Inspect server logs; backup: $run"
+    fi
+    rm -rf --one-file-system -- "$tmpdir"
+    unlock_ops
+    return "$rc"
+}
+
+css_autoupdate_enable() {   # [quiet]
+    local quiet=${1:-0}
+    command -v systemctl >/dev/null 2>&1 || { ((quiet)) || err "systemctl is not available."; return 1; }
+    cat >"/etc/systemd/system/$CSS_TIMER_UNIT.service" <<EOF
+[Unit]
+Description=CS2NEXUS official CounterStrikeSharp updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SELF css-update
+EOF
+    cat >"/etc/systemd/system/$CSS_TIMER_UNIT.timer" <<EOF
+[Unit]
+Description=Check official CounterStrikeSharp releases every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    if systemctl daemon-reload && systemctl enable --now "$CSS_TIMER_UNIT.timer" >/dev/null 2>&1; then
+        conf_set CSS_AUTOUPDATE 1 || true
+        ((quiet)) || ok "Official CounterStrikeSharp auto-update enabled (checks every 6 hours)."
+        return 0
+    fi
+    ((quiet)) || err "Could not enable CounterStrikeSharp auto-update timer."
+    return 1
+}
+
+css_autoupdate_disable() {
+    command -v systemctl >/dev/null 2>&1 && systemctl disable --now "$CSS_TIMER_UNIT.timer" >/dev/null 2>&1 || true
+    rm -f -- "/etc/systemd/system/$CSS_TIMER_UNIT.service" "/etc/systemd/system/$CSS_TIMER_UNIT.timer"
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload
+    conf_set CSS_AUTOUPDATE 0 || true
+    ok "CounterStrikeSharp auto-update disabled."
+}
+
+css_updater_menu() {
+    local c enabled=0 current latest_json latest
+    systemctl is-active --quiet "$CSS_TIMER_UNIT.timer" 2>/dev/null && enabled=1
+    current=$(cat "$CSS_STATE_FILE" 2>/dev/null || echo 'unknown / not tracked')
+    header "COUNTERSTRIKESHARP UPDATER"
+    printf '  Source          : https://github.com/roflmuffin/CounterStrikeSharp/releases\n'
+    printf '  Last installed  : %s\n' "$current"
+    printf '  Periodic update : %s\n\n' "$([[ $enabled == 1 ]] && echo 'ENABLED (every 6 hours)' || echo 'disabled')"
+    echo "  1) Check and install latest official release now"
+    echo "  2) $( ((enabled)) && echo 'Disable' || echo 'Enable') periodic auto-update"
+    echo "  3) Roll back to the latest saved backup"
+    echo "  4) Back"
+    echo
+    read -r -p "Select: " c || return
+    case "$(trim "$c")" in
+        1) css_update_run 0; pause ;;
+        2) if ((enabled)); then css_autoupdate_disable; else css_autoupdate_enable; fi; pause ;;
+        3) css_rollback_latest; pause ;;
+        4|q|Q) return ;;
+        *) err "Invalid option."; sleep 1 ;;
+    esac
+}
+
 maintenance_menu() {
     local c
     while :; do
@@ -2605,7 +2927,8 @@ maintenance_menu() {
         echo "6) Resource alerts (CPU / RAM / disk limits)"
         echo "7) Update launcher"
         echo "8) Launcher settings"
-        echo "9) Back"
+        echo "9) CounterStrikeSharp updater (official / auto-update / rollback)"
+        echo "10) Back"
         echo
         read -r -p "Select: " c || exit 0
         case "$(trim "$c")" in
@@ -2617,7 +2940,8 @@ maintenance_menu() {
             6) alerts_menu ;;
             7) update_launcher_ui; pause ;;
             8) launcher_settings_ui ;;
-            9|q|Q) return ;;
+            9) css_updater_menu ;;
+            10|q|Q) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -4411,7 +4735,7 @@ REQUIRED_CMDS=(jq tmux ss runuser flock find cmp diff mktemp awk sed curl unzip 
 
 conf_valid_key() {
     case $1 in
-        BASE|SETUP_DONE|NEXUS_REPO|NEXUS_BRANCH|EXTRA_PLUGIN_REPOS|GITHUB_TOKEN|AUTOUPDATE|UPDATE_ACTION|STEAMCMD) return 0 ;;
+        BASE|SETUP_DONE|NEXUS_REPO|NEXUS_BRANCH|EXTRA_PLUGIN_REPOS|GITHUB_TOKEN|AUTOUPDATE|CSS_AUTOUPDATE|UPDATE_ACTION|STEAMCMD) return 0 ;;
     esac
     return 1
 }
@@ -4421,7 +4745,7 @@ conf_valid_value() {   # <key> <value>
     [[ $v =~ ^[A-Za-z0-9_./:@,\ -]*$ ]] || return 1
     case $k in
         BASE|STEAMCMD)  [[ $v =~ ^/[A-Za-z0-9_./-]+$ ]] ;;
-        SETUP_DONE|AUTOUPDATE) [[ $v == 0 || $v == 1 ]] ;;
+        SETUP_DONE|AUTOUPDATE|CSS_AUTOUPDATE) [[ $v == 0 || $v == 1 ]] ;;
         UPDATE_ACTION)  [[ $v == none || $v == reload ]] ;;
         NEXUS_REPO)     [[ $v =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ;;
         NEXUS_BRANCH)   [[ $v =~ ^[A-Za-z0-9_./-]+$ ]] ;;
@@ -7193,6 +7517,7 @@ Usage: $SELF [command]
   broadcast MESSAGE...      send "say MESSAGE" to every running server
   watchdog                  start offline autostart servers (used by the timer)
   plugin-update             update plugins installed from the Plugin Browser (used by the timer)
+  css-update                update official CounterStrikeSharp release (used by the timer)
   astra-fix [--refresh]     fix AstraSkins on every server (gamedata file + core.json); --refresh re-downloads the signature
   backup                    make a data backup now (used by the timer)
   panel-export              refresh the server list shown on the web panel (used by the panel service)
@@ -7338,6 +7663,7 @@ cli_main() {
         broadcast) preflight cli; cli_broadcast "$@" ;;
         watchdog)  preflight cli; watchdog_run ;;
         plugin-update) preflight cli; plugins_update_run 1 ;;
+        css-update) preflight cli; css_update_run 1 ;;
         backup)    preflight cli; backup_run auto ;;
         alert-check) preflight cli; alert_check ;;
         panel-export) preflight cli; panel_export_servers ;;
