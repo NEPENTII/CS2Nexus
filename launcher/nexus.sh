@@ -3228,7 +3228,9 @@ readonly AL_LOG="/var/log/cs2nexus-alerts.log"
 readonly AL_STATE="$STATE_DIR/alerts.state"
 
 alert_send() {   # <text>   (never fails the caller)
-    local msg=$1 url tok chat
+    # Routes: log + journal + optional webhook + Telegram (via Cloudflare Worker) + Bale.
+    # Telegram never talks to api.telegram.org from this host — only https://telbot.cs2nexus.ir/
+    local msg=$1 url tok proxy_key tg_chat
     printf '%s %s\n' "$(date '+%F %T')" "$msg" >>"$AL_LOG" 2>/dev/null
     if [[ -f $AL_LOG ]] && (($(stat -c %s "$AL_LOG" 2>/dev/null || echo 0) > 1048576)); then tail -n 2000 "$AL_LOG" >"$AL_LOG.tmp" && mv -f "$AL_LOG.tmp" "$AL_LOG"; fi
     command -v logger >/dev/null 2>&1 && logger -t cs2nexus-alert -- "$msg"
@@ -3237,9 +3239,18 @@ alert_send() {   # <text>   (never fails the caller)
     if [[ -n $url ]]; then
         curl -fsS -m 10 -H 'Content-Type: application/json' -d "$(jq -nc --arg c "$msg" '{content:$c, text:$c}')" "$url" >/dev/null 2>&1 || true
     fi
-    tok=$(fx_get ALERT_TG_TOKEN); chat=$(fx_get ALERT_TG_CHAT)
-    if [[ -n $tok && -n $chat ]]; then
-        curl -fsS -m 10 "https://api.telegram.org/bot$tok/sendMessage" --data-urlencode "chat_id=$chat" --data-urlencode "text=$msg" >/dev/null 2>&1 || true
+    tok=$(fx_get ALERT_TG_TOKEN)
+    proxy_key=$(fx_get ALERT_TG_PROXY_KEY)
+    # Require token + Worker key + at least one chat id. Failures never abort the caller.
+    if [[ -n $tok && -n $proxy_key ]]; then
+        while IFS= read -r tg_chat; do
+            [[ -n $tg_chat ]] || continue
+            curl -fsS -m 15 \
+                -H "X-Proxy-Key: $proxy_key" \
+                --data-urlencode "chat_id=$tg_chat" \
+                --data-urlencode "text=$msg" \
+                "https://telbot.cs2nexus.ir/bot${tok}/sendMessage" >/dev/null 2>&1 || true
+        done < <(printf '%s\n%s\n' "$(fx_get ALERT_TG_CHAT)" "$(fx_get ALERT_TG_CHAT2)" | awk 'NF && !seen[$0]++')
     fi
     bale_send "$msg"
 }
@@ -3345,7 +3356,7 @@ $snip"
             ;;
         *) return 0 ;;
     esac
-    bale_send "$msg"
+    alert_send "$msg"
 }
 
 
@@ -3465,13 +3476,13 @@ alerts_menu() {
         printf '  Also checks    : every running server (its share of the machine, same CPU/RAM limits)\n'
         printf '  Log file       : %s\n' "$AL_LOG"
         v=$(fx_get ALERT_WEBHOOK); printf '  Webhook        : %s\n' "${v:+set}${v:-not set}"
-        v=$(fx_get ALERT_TG_TOKEN); printf '  Telegram       : %s\n' "$([[ -n $v && -n $(fx_get ALERT_TG_CHAT) ]] && echo set || echo 'not set')"
+        v=$(fx_get ALERT_TG_TOKEN); printf '  Telegram       : %s\n' "$([[ -n $v && -n $(fx_get ALERT_TG_CHAT) && -n $(fx_get ALERT_TG_PROXY_KEY) ]] && echo "set (Worker; $( [[ -n $(fx_get ALERT_TG_CHAT2) ]] && echo '2 recipients' || echo '1 recipient' ))" || echo 'not set / incomplete')"
         printf '  Bale           : token %s, chat1 %s, chat2 %s\n\n' "$([[ -n $(bale_token) ]] && echo set || echo 'not set')" "$([[ -n $(fx_get BALE_CHAT_ID) ]] && echo set || echo empty)" "$([[ -n $(fx_get BALE_CHAT_ID2) ]] && echo set || echo empty)"
         echo "  1) Turn alerts ON / OFF"
         echo "  2) Change the limits (CPU, RAM, disk)"
         echo "  3) Change how long / how often"
         echo "  4) Set the webhook (Discord or any URL that accepts JSON)"
-        echo "  5) Set Telegram (bot token + chat id)"
+        echo "  5) Set Telegram (Worker key + bot token + 2 chat ids)"
         echo "  6) Send a test alert"
         echo "  7) Show the alert log"
         echo "  8) Bale: auto-detect chat id (open bot, send /start, then run this)"
@@ -3488,13 +3499,27 @@ alerts_menu() {
                ask_num "Repeat the same alert at most every (minutes)" "$(fx_num ALERT_COOLDOWN 30 1 1440)" 1 1440; fx_set ALERT_COOLDOWN "$ANSWER"; ok "Saved."; pause ;;
             4) read -r -p "Webhook URL (empty = remove): " v || exit 0; v=$(trim "$v")
                if [[ -z $v || $v =~ ^https?://[^[:space:]]+$ ]]; then fx_set ALERT_WEBHOOK "$v"; ok "Saved."; else err "That is not an http(s) URL."; fi; pause ;;
-            5) read -r -p "Telegram bot token (empty = remove): " v || exit 0; v=$(trim "$v")
-               if [[ -z $v ]]; then fx_set ALERT_TG_TOKEN ""; fx_set ALERT_TG_CHAT ""; ok "Removed."
+            5) read -rsp "Telegram bot token (empty = remove): " v || exit 0; echo; v=$(trim "$v")
+               if [[ -z $v ]]; then
+                   fx_set ALERT_TG_TOKEN ""; fx_set ALERT_TG_CHAT ""; fx_set ALERT_TG_CHAT2 ""; fx_set ALERT_TG_PROXY_KEY ""; ok "Telegram settings removed."
                elif [[ $v =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
-                   fx_set ALERT_TG_TOKEN "$v"; read -r -p "Chat id: " v || exit 0; v=$(trim "$v")
-                   [[ $v =~ ^-?[0-9]+$ ]] && { fx_set ALERT_TG_CHAT "$v"; ok "Saved."; } || err "The chat id is a number."
+                   read -r -p "Telegram chat id #1: " chat_input || exit 0; chat_input=$(trim "$chat_input")
+                   if [[ $chat_input =~ ^-?[0-9]+$ ]]; then
+                       read -r -p "Telegram chat id #2 (empty = only first recipient): " chat_input2 || exit 0; chat_input2=$(trim "$chat_input2")
+                       if [[ -z $chat_input2 || $chat_input2 =~ ^-?[0-9]+$ ]]; then
+                           read -rsp "Cloudflare Worker PROXY_KEY: " proxy_input || exit 0; echo
+                           proxy_input=$(trim "$proxy_input")
+                           if [[ -n $proxy_input ]]; then
+                               fx_set ALERT_TG_TOKEN "$v"
+                               fx_set ALERT_TG_CHAT "$chat_input"
+                               fx_set ALERT_TG_CHAT2 "$chat_input2"
+                               fx_set ALERT_TG_PROXY_KEY "$proxy_input"
+                               ok "Telegram Worker settings saved for up to two recipients."
+                           else err "Worker key cannot be empty; Telegram settings were not saved."; fi
+                       else err "The second chat id must be a number or empty."; fi
+                   else err "The first chat id must be a number."; fi
                else err "That does not look like a bot token."; fi; pause ;;
-            6) alert_send "TEST: this is a test alert from CS2Nexus."; ok "Sent (log, journal$([[ -n $(fx_get ALERT_WEBHOOK) ]] && echo ', webhook')$([[ -n $(fx_get ALERT_TG_TOKEN) ]] && echo ', Telegram')$([[ -n $(fx_get BALE_CHAT_ID)$(fx_get BALE_CHAT_ID2) ]] && echo ', Bale'))."; pause ;;
+            6) alert_send "TEST: this is a test alert from CS2Nexus."; ok "Sent (log, journal$([[ -n $(fx_get ALERT_WEBHOOK) ]] && echo ', webhook')$([[ -n $(fx_get ALERT_TG_TOKEN) && -n $(fx_get ALERT_TG_CHAT) && -n $(fx_get ALERT_TG_PROXY_KEY) ]] && echo ', Telegram')$([[ -n $(fx_get BALE_CHAT_ID)$(fx_get BALE_CHAT_ID2) ]] && echo ', Bale'))."; pause ;;
             7) if [[ -s $AL_LOG ]]; then tail -n 30 "$AL_LOG"; else info "The log is empty."; fi; pause ;;
             8) bale_discover_chat; pause ;;
             9) read -r -p "Bale bot token (empty = keep default): " v || exit 0; v=$(trim "$v")
