@@ -1,0 +1,17 @@
+{
+  "name": "NexusAdminTools",
+  "version": "3.0.0",
+  "author": "CS2Nexus",
+  "description": "Admin powers for CS2Nexus servers: wallhack, invisibility, god mode, speed, HP and infinite money. Every command is controlled by the launcher permissions (Admins -> permissions, @nepentii/<name>). Based on CS2-AdminTools / plugin-wallhack by NeuTroNBZh and labaland (MIT).",
+  "commands": [
+    { "name": "wh", "description": "Wallhack: glowing outline of the enemies through walls (toggle). Permission: wh.", "usage": "!wh [player]", "aliases": ["wallhack"] },
+    { "name": "invis", "description": "Invisible: player and weapons hidden from everybody (toggle). Permission: invis.", "usage": "!invis [player]", "aliases": ["invisible"] },
+    { "name": "god", "description": "God mode: cannot die (toggle). Permission: god.", "usage": "!god [player]", "aliases": [] },
+    { "name": "speed", "description": "Speed boost, default 1.5x (0.1 - 10). Permission: speed.", "usage": "!speed [multiplier] [player]", "aliases": [] },
+    { "name": "hp", "description": "Set health, also above 100. Permission: hp.", "usage": "!hp <amount> [player]", "aliases": [] },
+    { "name": "infmoney", "description": "Infinite money, refilled after every buy, spawn and round (toggle). Permission: infmoney.", "usage": "!infmoney <player>", "aliases": [] },
+    { "name": "resetall", "description": "Remove every power from every player. Permission: resetall.", "usage": "!resetall", "aliases": [] },
+    { "name": "privs", "description": "Show the active powers of a player. Permission: privs.", "usage": "!privs <player>", "aliases": [] }
+  ],
+  "configs": ["NexusAdminTools.json"]
+}
