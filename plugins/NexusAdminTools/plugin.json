@@ -1,6 +1,6 @@
 {
   "name": "NexusAdminTools",
-  "version": "3.0.0",
+  "version": "3.0.2",
   "author": "CS2Nexus",
   "description": "Admin powers for CS2Nexus servers: wallhack, invisibility, god mode, speed, HP and infinite money. Every command is controlled by the launcher permissions (Admins -> permissions, @nepentii/<name>). Based on CS2-AdminTools / plugin-wallhack by NeuTroNBZh and labaland (MIT).",
   "commands": [
