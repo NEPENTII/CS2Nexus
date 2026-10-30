@@ -1,5 +1,0 @@
-{
-    "core.debugprint": "[PanoramaVoteManager][DEBUG]: {message}",
-    "core.config": "[PanoramaVoteManager] Configuration loaded",
-    "vote.cooldown": "Your vote will start in approximately {time} seconds"
-}
