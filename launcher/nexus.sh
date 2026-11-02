@@ -20,6 +20,7 @@
 #  Usage:
 #    nexus                              interactive menu (nexus.sh)
 #    nexus help                         non-interactive commands (cron/systemd)
+#    nexus tgbot install|start|stop|..  built-in Telegram admin bot (menu item 18)
 # =============================================================================
 
 set -u
@@ -4588,7 +4589,7 @@ bk_keep() { fx_num BACKUP_KEEP 14 1 365; }
 # every path (file or folder) that holds data worth keeping; only existing ones are printed
 bk_collect() {
     local p id row spath rel
-    local -a list=("$DB" "$FX_FILE" "$CONF_FILE" "$SHARED_DIR/configs" "$VAULT_DIR" "$PANEL_DIR/data")
+    local -a list=("$DB" "$FX_FILE" "$CONF_FILE" "$SHARED_DIR/configs" "$VAULT_DIR" "$PANEL_DIR/data" "$TG_DIR")
     for p in "$SHARED_DIR"/*.json; do list+=("$p"); done
     while IFS=$'\t' read -r id spath; do
         [[ -n $spath ]] || continue
@@ -4662,6 +4663,7 @@ bk_scope_pattern() {
         admins)   echo '/configs/(admins\.json|ServerCommandsAdmins\.json)$' ;;
         settings) echo "^\\./($(printf '%s' "${DB#/}" | sed 's/[.]/\\./g')|${SHARED_DIR#/}/[^/]*\\.json|${SHARED_DIR#/}/nexus-features\\.conf|etc/cs2nexus\\.conf)|/cfg/(server|cs2nexus_settings)\\.cfg\$" ;;
         panel)    echo "^\\./${PANEL_DIR#/}/data|/configs/plugins/NexusLink/" ;;
+        tgbot)    echo "^\\./${TG_DIR#/}" ;;
     esac
 }
 
@@ -4690,10 +4692,11 @@ backup_restore_ui() {
     echo "   4) Admin files"
     echo "   5) Server list, settings, registries and server.cfg"
     echo "   6) Web panel data"
+    echo "   7) Telegram bot (config + renewal dates)"
     echo "   b) Back"; echo
     read -r -p "Select: " c || exit 0
     case "$(trim "$c")" in
-        1) scope=all ;; 2) scope=wp ;; 3) scope=bans ;; 4) scope=admins ;; 5) scope=settings ;; 6) scope=panel ;;
+        1) scope=all ;; 2) scope=wp ;; 3) scope=bans ;; 4) scope=admins ;; 5) scope=settings ;; 6) scope=panel ;; 7) scope=tgbot ;;
         *) return ;;
     esac
     run=$(jq -r '.[].id' "$DB" 2>/dev/null | while read -r i; do is_running "$i" && printf '%s ' "$i"; done)
@@ -4719,6 +4722,7 @@ backup_restore_ui() {
     rm -rf --one-file-system -- "$tmp"
     ok "Restored $cnt file(s). Start your servers again."
     [[ $scope == all || $scope == settings ]] && info "Run 'Plugins -> Sync' once so every server picks up its files."
+    if [[ $scope == all || $scope == tgbot ]] && tgbot_installed; then systemctl restart "$TG_SVC" 2>/dev/null || true; fi
     if [[ $scope == all || $scope == wp ]] && [[ -s $SHARED_DIR/weaponpaints.sql ]]; then
         info "The WeaponPaints database dump is at $SHARED_DIR/weaponpaints.sql. Import it with: $(basename -- "$(wp_sql_bin 2>/dev/null || echo mariadb)") $(wp_db_get name 2>/dev/null) < $SHARED_DIR/weaponpaints.sql"
     fi
@@ -6775,6 +6779,1444 @@ mon_fmt_mb() {   # <MB> -> 812M / 3.4G
     awk -v m="${1:-0}" 'BEGIN{ if (m >= 1024) printf "%.1fG", m / 1024; else printf "%dM", m }'
 }
 
+
+# =============================================================================
+#  TELEGRAM BOT (built-in)  -  Persian admin menu bot for the 2 admin chats
+#
+#  A self-contained Python bot (stdlib only) is embedded below and installed
+#  to /opt/cs2nexus-tgbot as the systemd service cs2nexus-tgbot.
+#    CLI  : nexus tgbot install|start|stop|restart|status|logs|uninstall
+#    Menu : main menu -> 18) Telegram Bot
+#  Token / admin chats come from $FX_FILE (ALERT_TG_TOKEN / ALERT_TG_PROXY_KEY /
+#  ALERT_TG_CHAT / ALERT_TG_CHAT2 - the same values alert_send uses) or from
+#  bot_token / admin_ids in /opt/cs2nexus-tgbot/config.json (overrides).
+#  Bot menu: server list, players inside a server (console status), console +
+#  game logs, join/leave history, purchase + renewal dates with automatic
+#  expiry warnings, start/stop/restart/say/backup/sync/doctor actions.
+# =============================================================================
+TG_DIR="/opt/cs2nexus-tgbot"
+TG_UNIT="/etc/systemd/system/cs2nexus-tgbot.service"
+TG_SVC="cs2nexus-tgbot"
+
+_tgbot_python_payload() {
+    cat <<'TG_BOT_PY_EOF_9F3A'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CS2Nexus Telegram Bot — admin menu bot for the nexus.sh CS2 server manager.
+
+Who may use it: only the chat IDs configured in config.json ("admin_ids"),
+or (when empty) the two IDs nexus.sh already uses for alerts
+(ALERT_TG_CHAT / ALERT_TG_CHAT2 in /opt/cs2-servers/shared/nexus-features.conf).
+
+Token routing: config.json first, then ALERT_TG_TOKEN from the same features
+file. If a proxy key (ALERT_TG_PROXY_KEY) exists, every Telegram call goes to
+the proxy base (default https://telbot.cs2nexus.ir) with the X-Proxy-Key
+header, exactly like nexus.sh alert_send() does.
+
+Menu (Persian, inline buttons):
+  - server list with online/offline state
+  - per-server panel: status, port, map, slots, address, uptime, password,
+    purchase date, renewal/expiry date with days left
+  - players currently inside a server (console "status" query via tmux,
+    log-based fallback)
+  - logs: console tail, game log tail, join/leave history
+  - dates: set/change purchase + renewal date (YYYY-MM-DD or +N days)
+  - tools: start / stop / restart (via nexus.sh CLI), say, backup, plugin
+    sync, doctor
+  - hourly expiry watchdog that warns the admins when a renewal date is near
+
+Python 3.8+, standard library only.
+"""
+
+import html
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from datetime import date, datetime, timedelta, timezone
+from urllib import request as _rq
+from urllib.error import HTTPError, URLError
+
+# --------------------------------------------------------------------------- #
+#  Configuration                                                              #
+# --------------------------------------------------------------------------- #
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.environ.get("CS2NEXUS_TGBOT_CONFIG") or os.path.join(SCRIPT_DIR, "config.json")
+
+DEFAULTS = {
+    "bot_token": "",
+    "admin_ids": [],
+    "api_base": "",                                   # empty = auto (proxy or api.telegram.org)
+    "proxy_key": "",                                  # X-Proxy-Key header (Cloudflare worker)
+    "nexus_sh": "/opt/nexus.sh",
+    "features_conf": "/opt/cs2-servers/shared/nexus-features.conf",
+    "servers_json": "/opt/cs2-servers/servers.json",
+    "csgo_user": "cs2",
+    "data_file": os.path.join(SCRIPT_DIR, "data.json"),
+    "tz_offset_min": 210,                             # Iran Standard Time +03:30
+    "expiry_warn_days": 7,
+    "poll_timeout": 25,
+    "player_query_wait": 2.0,
+}
+
+log = logging.getLogger("cs2nexus-tgbot")
+
+
+def _read_kv(path):
+    """KEY=VALUE lines -> dict (same format as nexus-features.conf)."""
+    kv = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"')
+                if re.fullmatch(r"[A-Za-z0-9_]+", k):
+                    kv[k] = v
+    except OSError:
+        pass
+    return kv
+
+
+def _ints(*vals):
+    out = []
+    for v in vals:
+        for m in re.findall(r"\d{3,}", v or ""):
+            i = int(m)
+            if i not in out:
+                out.append(i)
+    return out
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            for k in list(cfg.keys()):
+                if user.get(k) not in (None, "", []):
+                    cfg[k] = user[k]
+    except (OSError, ValueError):
+        pass
+
+    fx = _read_kv(cfg["features_conf"])
+    if not cfg["bot_token"]:
+        cfg["bot_token"] = fx.get("ALERT_TG_TOKEN", "")
+    if not cfg["proxy_key"]:
+        cfg["proxy_key"] = fx.get("ALERT_TG_PROXY_KEY", "")
+    if not cfg["admin_ids"]:
+        cfg["admin_ids"] = _ints(fx.get("ALERT_TG_CHAT", ""), fx.get("ALERT_TG_CHAT2", ""))
+    if not cfg["api_base"]:
+        cfg["api_base"] = ("https://telbot.cs2nexus.ir" if cfg["proxy_key"]
+                           else "https://api.telegram.org")
+    try:
+        cfg["admin_ids"] = [int(i) for i in (cfg["admin_ids"] or [])]
+    except (TypeError, ValueError):
+        cfg["admin_ids"] = []
+    for k in ("tz_offset_min", "expiry_warn_days", "poll_timeout"):
+        try:
+            cfg[k] = int(cfg[k])
+        except (TypeError, ValueError):
+            cfg[k] = int(DEFAULTS[k])
+    try:
+        cfg["player_query_wait"] = float(cfg["player_query_wait"])
+    except (TypeError, ValueError):
+        cfg["player_query_wait"] = float(DEFAULTS["player_query_wait"])
+    return cfg
+
+
+CFG = load_config()
+
+# --------------------------------------------------------------------------- #
+#  Telegram API                                                               #
+# --------------------------------------------------------------------------- #
+
+
+class TgError(Exception):
+    pass
+
+
+def tg(method, payload=None, timeout=40):
+    url = "%s/bot%s/%s" % (CFG["api_base"].rstrip("/"), CFG["bot_token"], method)
+    data = json.dumps(payload or {}).encode("utf-8")
+    hdr = {"Content-Type": "application/json"}
+    if CFG["proxy_key"]:
+        hdr["X-Proxy-Key"] = CFG["proxy_key"]
+    req = _rq.Request(url, data=data, headers=hdr)
+    try:
+        with _rq.urlopen(req, timeout=timeout) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+    except HTTPError as e:
+        try:
+            desc = json.loads(e.read().decode("utf-8")).get("description", str(e))
+        except Exception:
+            desc = str(e)
+        raise TgError(desc)
+    except (URLError, TimeoutError, OSError) as e:
+        raise TgError(str(e))
+    if not resp.get("ok"):
+        raise TgError(str(resp.get("description", "unknown error")))
+    return resp["result"]
+
+
+MAXLEN = 3800
+
+
+def esc(s):
+    return html.escape(str(s if s is not None else ""), quote=False)
+
+
+def _strip_html(text):
+    return re.sub(r"</?(b|i|u|s|code|pre|a|tg-spoiler)[^>]*>", "", text)
+
+
+def _chunk(text, limit=MAXLEN):
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        parts.append(text)
+    return parts
+
+
+def send(chat_id, text, kb=None, quiet=False):
+    """Send (HTML) text, chunked; inline keyboard goes on the last chunk."""
+    parts = _chunk(text)
+    last = len(parts) - 1
+    result = None
+    for i, part in enumerate(parts):
+        payload = {"chat_id": chat_id, "text": part, "parse_mode": "HTML",
+                   "disable_web_page_preview": True, "disable_notification": quiet and i < last}
+        if kb is not None and i == last:
+            payload["reply_markup"] = {"inline_keyboard": kb}
+        try:
+            result = tg("sendMessage", payload, timeout=30)
+        except TgError as e:
+            if "parse" in str(e).lower() or "entit" in str(e).lower():
+                payload.pop("parse_mode", None)
+                payload["text"] = _strip_html(part)
+                try:
+                    result = tg("sendMessage", payload, timeout=30)
+                    continue
+                except TgError as e2:
+                    log.warning("sendMessage failed: %s", e2)
+            else:
+                log.warning("sendMessage failed: %s", e)
+    return result
+
+
+def edit(chat_id, msg_id, text, kb=None):
+    payload = {"chat_id": chat_id, "message_id": msg_id, "text": text,
+               "parse_mode": "HTML", "disable_web_page_preview": True}
+    if kb is not None:
+        payload["reply_markup"] = {"inline_keyboard": kb}
+    try:
+        tg("editMessageText", payload, timeout=30)
+        return True
+    except TgError as e:
+        s = str(e).lower()
+        if "message is not modified" in s:
+            return True
+        if "parse" in s or "entit" in s:
+            payload.pop("parse_mode", None)
+            payload["text"] = _strip_html(text)
+            try:
+                tg("editMessageText", payload, timeout=30)
+                return True
+            except TgError as e2:
+                log.warning("editMessageText failed: %s", e2)
+                return False
+        log.info("editMessageText -> new message (%s)", e)
+        return False
+
+
+PANEL = {}       # chat_id -> panel message id
+PENDING = {}     # chat_id -> pending input state
+
+
+def show_panel(chat_id, text, kb_rows):
+    mid = PANEL.get(chat_id)
+    if mid and edit(chat_id, mid, text, kb_rows):
+        return
+    m = send(chat_id, text, kb_rows)
+    if m:
+        PANEL[chat_id] = m["message_id"]
+
+
+def kb(rows):
+    return [[{"text": t, "callback_data": d} for t, d in row] for row in rows]
+
+
+# --------------------------------------------------------------------------- #
+#  nexus.sh integration                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def nexus(args, timeout=300):
+    argv = [CFG["nexus_sh"]] + [str(a) for a in args]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except FileNotFoundError:
+        return 127, "", "nexus.sh not found: %s" % CFG["nexus_sh"]
+    except subprocess.TimeoutExpired:
+        return 124, "", "command timed out"
+
+
+def _nexus_json(args, timeout):
+    rc, out, _ = nexus(args, timeout)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out.strip())
+        return data if isinstance(data, list) else None
+    except ValueError:
+        return None
+
+
+def tmux(*args):
+    try:
+        p = subprocess.run(["runuser", "-u", str(CFG["csgo_user"]), "--", "tmux"] + list(args),
+                           capture_output=True, text=True, timeout=25)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except Exception as e:  # runuser missing / not root / timeout
+        return 1, "", str(e)
+
+
+def is_running(sid):
+    rc, _, _ = tmux("has-session", "-t", "=cs2-%d" % sid)
+    return rc == 0
+
+
+def session_uptime(sid):
+    rc, out, _ = tmux("display-message", "-p", "-t", "=cs2-%d" % sid, "#{session_created}")
+    if rc == 0:
+        try:
+            return max(0, int(time.time() - int(out.strip())))
+        except ValueError:
+            pass
+    return None
+
+
+def fallback_servers():
+    """Read servers.json directly (only used when nexus.sh list --json fails)."""
+    try:
+        with open(CFG["servers_json"], "r", encoding="utf-8") as f:
+            rows = json.load(f)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            sid = int(r.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        out.append({
+            "id": sid, "name": r.get("name", ""), "slug": r.get("slug", ""),
+            "port": r.get("port", 0), "maxplayers": r.get("maxplayers", 0),
+            "map": r.get("map", ""), "path": r.get("path", ""),
+            "status": "ONLINE" if is_running(sid) else "OFFLINE",
+            "session": "cs2-%d" % sid, "password": False,
+            "players": None, "bots": None,
+        })
+    return out
+
+
+def servers_list():
+    data = _nexus_json(["list", "--json"], 180)
+    if data is not None:
+        return data
+    return fallback_servers()
+
+
+def server_one(sid):
+    data = _nexus_json(["status", str(sid), "--json"], 180)
+    if data:
+        return data[0]
+    for s in fallback_servers():
+        if s["id"] == sid:
+            return s
+    return None
+
+
+# --------------------------------------------------------------------------- #
+#  Players (console status via tmux, same parsing as nexus query_players)     #
+# --------------------------------------------------------------------------- #
+
+RE_HUMANS = re.compile(r"(\d+)\s+humans?,\s+(\d+)\s+bots?")
+RE_ROW = re.compile(r"^\s*(\d+)\s+([0-9:]+)\s+(\d+)\s+(\d+)\s+([a-z]+)\s+(\d+)\s+(\S+)\s+'(.*)'\s*$")
+
+
+def parse_status_capture(out):
+    humans = bots = None
+    for line in out.splitlines():
+        if line.strip().startswith("players"):
+            m = RE_HUMANS.search(line)
+            if m:
+                humans, bots = int(m.group(1)), int(m.group(2))
+    if humans is None:
+        return None
+    rows, inblk = [], False
+    for line in out.splitlines():
+        if re.match(r"^\s*id\s+time\s+ping", line):
+            inblk = True
+            continue
+        if inblk:
+            if "#end" in line:
+                break
+            m = RE_ROW.match(line)
+            if m and m.group(7) != "BOT":
+                rows.append({"name": m.group(8), "time": m.group(2),
+                             "ping": m.group(3), "state": m.group(5)})
+    return {"humans": humans, "bots": bots or 0, "rows": rows}
+
+
+def query_players(sid):
+    if not is_running(sid):
+        return None
+    tmux("send-keys", "-t", "=cs2-%d:" % sid, "status", "Enter")
+    time.sleep(float(CFG["player_query_wait"]))
+    rc, out, _ = tmux("capture-pane", "-p", "-J", "-t", "=cs2-%d:" % sid, "-S", "-300")
+    if rc != 0:
+        return None
+    return parse_status_capture(out)
+
+
+# --------------------------------------------------------------------------- #
+#  Logs (console.log via pipe-pane + game logs written by sv_logfile)         #
+# --------------------------------------------------------------------------- #
+
+
+def gamelog_files(path, limit=10):
+    logdir = os.path.join(path, "game", "csgo", "logs")
+    try:
+        fs = [os.path.join(logdir, f) for f in os.listdir(logdir) if f.endswith(".log")]
+        fs = [f for f in fs if os.path.isfile(f)]
+        fs.sort(key=lambda f: os.path.getmtime(f))
+        return fs[-limit:]
+    except OSError:
+        return []
+
+
+RE_JL = re.compile(
+    r'^L (\d{2}/(\d{2})/(\d{4})) - (\d{2}:\d{2}:\d{2}): '
+    r'"(.+?)<[0-9]+><[^>]*><[^>]*>" (entered the game|disconnected)')
+
+
+def history_events(path, n=20):
+    evs = []
+    for f in gamelog_files(path, 10):
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = RE_JL.match(line)
+                    if m:
+                        # MM/DD/YYYY -> YYYY-MM-DD
+                        iso = "%s-%s-%s" % (m.group(3), m.group(1)[:2], m.group(2))
+                        evs.append((iso + " " + m.group(4), m.group(6), m.group(5)))
+        except OSError:
+            continue
+    return evs[-n:]
+
+
+def players_from_logs(path):
+    """Approximate current players by replaying join/leave events (fallback)."""
+    cur = {}
+    for f in gamelog_files(path, 10):
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = RE_JL.match(line)
+                    if not m:
+                        continue
+                    name, ev = m.group(5), m.group(6)
+                    if ev == "entered the game":
+                        cur[name] = True
+                    else:
+                        cur.pop(name, None)
+        except OSError:
+            continue
+    return list(cur.keys())
+
+
+def tail_file(path, n=30, maxlen=3300):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    if not lines:
+        return ""
+    sel = lines[-n:]
+    text = "".join(sel)
+    while len(text) > maxlen and len(sel) > 1:
+        sel.pop(0)
+        text = "".join(sel)
+    return text.strip("\n")
+
+
+# --------------------------------------------------------------------------- #
+#  Dates (purchase / renewal) stored in data.json                             #
+# --------------------------------------------------------------------------- #
+
+DATA_LOCK = threading.Lock()
+
+
+def data_load():
+    try:
+        with open(CFG["data_file"], "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            d.setdefault("servers", {})
+            d.setdefault("warned", {})
+            return d
+    except (OSError, ValueError):
+        pass
+    return {"servers": {}, "warned": {}}
+
+
+def data_save(d):
+    tmp = str(CFG["data_file"]) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, CFG["data_file"])
+    except OSError as e:
+        log.error("cannot save %s: %s", CFG["data_file"], e)
+
+
+def srv_dates(sid):
+    with DATA_LOCK:
+        return dict(data_load()["servers"].get(str(sid), {}))
+
+
+def srv_dates_set(sid, field, iso):
+    with DATA_LOCK:
+        d = data_load()
+        s = d["servers"].setdefault(str(sid), {})
+        if iso is None:
+            s.pop(field, None)
+        else:
+            s[field] = iso
+        data_save(d)
+
+
+def warned_mark(key, today):
+    with DATA_LOCK:
+        d = data_load()
+        w = d["warned"]
+        w[key] = today
+        if len(w) > 300:
+            for k in sorted(w.keys())[: len(w) - 300]:
+                w.pop(k, None)
+        data_save(d)
+
+
+def warned_get(key):
+    with DATA_LOCK:
+        return data_load()["warned"].get(key)
+
+
+def tz():
+    return timezone(timedelta(minutes=int(CFG["tz_offset_min"])))
+
+
+def today_local():
+    return datetime.now(tz()).date()
+
+
+def parse_date_input(s):
+    """'2026-05-30' / '2026/5/30' -> ISO, or '+30' -> 30 days from today."""
+    s = (s or "").strip()
+    m = re.fullmatch(r"\+?(\d{1,4})", s)
+    if m:
+        return (today_local() + timedelta(days=int(m.group(1)))).isoformat()
+    m = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def days_left(iso):
+    try:
+        return (date.fromisoformat(iso) - today_local()).days
+    except (ValueError, TypeError):
+        return None
+
+
+def fmt_days(iso):
+    dl = days_left(iso)
+    if dl is None:
+        return ""
+    if dl > 0:
+        return "%d روز مانده" % dl
+    if dl == 0:
+        return "امروز آخرین روز است"
+    return "%d روز از انقضا گذشته" % (-dl)
+
+
+def day_icon(iso):
+    dl = days_left(iso)
+    if dl is None:
+        return "⚪️"
+    if dl > 14:
+        return "🟢"
+    if dl > 7:
+        return "🟠"
+    if dl >= 0:
+        return "🔴"
+    return "⛔️"
+
+
+def fmt_uptime(sec):
+    if sec is None:
+        return None
+    d, r = divmod(int(sec), 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    parts = []
+    if d:
+        parts.append("%d روز" % d)
+    if h:
+        parts.append("%d ساعت" % h)
+    if m and not d:
+        parts.append("%d دقیقه" % m)
+    return " و ".join(parts) or "کمتر از یک دقیقه"
+
+
+_IP = ""
+
+
+def primary_ip():
+    global _IP
+    if _IP:
+        return _IP
+    ip = ""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except OSError:
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            ip = "127.0.0.1"
+    _IP = ip
+    return ip
+
+
+# --------------------------------------------------------------------------- #
+#  Views (Persian UI)                                                         #
+# --------------------------------------------------------------------------- #
+
+KB_HOME = [
+    [("🖥 سرورها", "srvs"), ("ℹ️ وضعیت سیستم", "sys")],
+    [("🗓 هشدارهای تمدید", "exp"), ("❓ راهنما", "help")],
+]
+
+
+def main_text():
+    return "🤖 <b>پنل مدیریت CS2Nexus</b>\n\nیکی از گزینه‌های زیر را انتخاب کنید:"
+
+
+def help_text():
+    return (
+        "❓ <b>راهنمای ربات CS2Nexus</b>\n"
+        "\n"
+        "🖥 <b>سرورها</b> — لیست همه‌ی سرورها با وضعیت روشن/خاموش؛ با زدن هر سرور، پنل کامل آن باز می‌شود.\n"
+        "\n"
+        "<b>پنل هر سرور:</b>\n"
+        "• 👥 بازیکنان — لیست افراد داخل سرور (نام، مدت اتصال، پینگ، وضعیت)\n"
+        "• 📜 لاگ‌ها — کنسول، لاگ بازی و تاریخچه‌ی ورود/خروج بازیکنان\n"
+        "• 🗓 تاریخ‌ها — تنظیم زمان خرید و زمان تمدید (انقضا)\n"
+        "• 🛠 ابزارها — استارت، استاپ، ری‌استارت، پیام به بازیکنان (say)، بکاپ، سینک پلاگین‌ها، بررسی سلامت\n"
+        "\n"
+        "⏰ اگر تاریخ تمدید سروری نزدیک باشد (%d روز آخر)، به‌صورت خودکار پیام هشدار می‌گیرید.\n"
+        "\n"
+        "<b>دستورات:</b>\n"
+        "/start — منوی اصلی\n"
+        "/id — نمایش شناسه تلگرام شما\n"
+        "/cancel — لغو ورود فعلی\n"
+        "\n"
+        "🔒 دسترسی فقط برای شناسه‌های مجاز (ALERT_TG_CHAT / ALERT_TG_CHAT2 در "
+        "nexus-features.conf یا admin_ids در config.json)."
+    ) % int(CFG["expiry_warn_days"])
+
+
+def srv_name(s):
+    return s.get("name") or s.get("slug") or ("#%s" % s.get("id"))
+
+
+def servers_view():
+    ss = servers_list()
+    if not ss:
+        return "هنوز سروری ثبت نشده است.", kb([[("🏠 منوی اصلی", "home")]])
+    on = sum(1 for s in ss if s.get("status") == "ONLINE")
+    lines = ["🖥 <b>سرورها</b> (%d سرور، %d روشن)\n" % (len(ss), on)]
+    rows = []
+    for s in sorted(ss, key=lambda x: x.get("id", 0) or 0):
+        icon = "🟢" if s.get("status") == "ONLINE" else "🔴"
+        lines.append("%s #%s — %s — پورت %s" % (
+            icon, s.get("id"), esc(srv_name(s)), s.get("port")))
+        rows.append([("%s #%s  %s" % (icon, s.get("id"), srv_name(s)),
+                      "s:%s" % s.get("id"))])
+    rows.append([("🔄 بروزرسانی", "srvs"), ("🏠 منوی اصلی", "home")])
+    return "\n".join(lines), kb(rows)
+
+
+def panel_view(sid):
+    s = server_one(sid)
+    if not s:
+        return "❌ سرور با شناسه %s پیدا نشد." % sid, kb([[("↩️ بازگشت", "srvs")]]), None
+    on = s.get("status") == "ONLINE"
+    d = srv_dates(sid)
+    L = ["🎮 <b>%s</b>  (شناسه %s)" % (esc(srv_name(s)), s.get("id"))]
+    L.append("وضعیت: %s" % ("🟢 روشن" if on else "🔴 خاموش"))
+    L.append("پورت: <code>%s</code>  |  نقشه: %s  |  ظرفیت: %s" % (
+        s.get("port"), esc(s.get("map") or "-"), s.get("maxplayers")))
+    L.append("آدرس اتصال: <code>%s:%s</code>" % (primary_ip(), s.get("port")))
+    if on:
+        if s.get("players") is not None:
+            extra = "  (ربات: %s)" % s.get("bots") if s.get("bots") else ""
+            L.append("بازیکنان: %s/%s%s" % (s.get("players"), s.get("maxplayers"), extra))
+        up = session_uptime(sid)
+        if up:
+            L.append("آپ‌تایم: %s" % fmt_uptime(up))
+    L.append("رمز ورود: %s" % ("🔒 دارد" if s.get("password") else "ندارد"))
+    L.append("")
+    L.append("🛒 زمان خرید: %s" % (d.get("buy") or "ثبت نشده"))
+    if d.get("exp"):
+        L.append("⏰ زمان تمدید: %s  (%s %s)" % (d["exp"], day_icon(d["exp"]), fmt_days(d["exp"])))
+    else:
+        L.append("⏰ زمان تمدید: ثبت نشده")
+    rows = [
+        [("👥 بازیکنان", "s:%s:p" % sid), ("📜 لاگ‌ها", "s:%s:lg" % sid)],
+        [("🗓 تاریخ‌ها", "s:%s:dt" % sid), ("🛠 ابزارها", "s:%s:tl" % sid)],
+        [("🔄 بروزرسانی", "s:%s:rf" % sid), ("🏠 منو", "home")],
+    ]
+    return "\n".join(L), kb(rows), s
+
+
+def players_view(s):
+    sid = s.get("id")
+    nm = srv_name(s)
+    if s.get("status") != "ONLINE":
+        cur = players_from_logs(s.get("path", "") or "")
+        if cur:
+            names = "، ".join(esc(n) for n in sorted(cur))
+            return ("🔴 سرور «%s» خاموش است.\n\n🚪 آخرین افراد داخل سرور طبق لاگ "
+                    "(ممکن است قدیمی باشد):\n%s" % (esc(nm), names))
+        return "🔴 سرور «%s» خاموش است و بازیکنی داخلش نیست." % esc(nm)
+    res = query_players(sid)
+    if res is None:
+        cur = players_from_logs(s.get("path", "") or "")
+        if cur:
+            names = "، ".join(esc(n) for n in sorted(cur))
+            return ("⚠️ پاسخ کنسول سرور گرفته نشد؛ طبق لاگ، این افراد داخل سرور هستند:\n%s"
+                    % names)
+        return "❌ استعلام بازیکنان از «%s» ناموفق بود. چند لحظه دیگر دوباره امتحان کنید." % esc(nm)
+    head = ("👥 <b>بازیکنان «%s»</b>\n%s آنلاین | ربات: %s\n" %
+            (esc(nm), res["humans"], res["bots"]))
+    if not res["rows"]:
+        return head + "\n🕊 کسی داخل سرور نیست."
+    lines = [head]
+    for i, r in enumerate(res["rows"], 1):
+        lines.append("%d. <b>%s</b>" % (i, esc(r["name"])))
+        lines.append("    ⏱ اتصال: %s  |  پینگ: %s  |  %s" %
+                     (esc(r["time"]), esc(r["ping"]), esc(r["state"])))
+    return "\n".join(lines)
+
+
+def logs_menu_text(sid):
+    return ("📜 <b>لاگ‌های سرور #%s</b>\n\nکدام لاگ را می‌خواهید؟\n"
+            "(نتیجه به‌صورت پیام جدید ارسال می‌شود.)" % sid)
+
+
+def logs_menu_kb(sid):
+    return kb([
+        [("🖥 کنسول (۳۰ خط)", "lg:%s:c30" % sid), ("🖥 کنسول (۸۰ خط)", "lg:%s:c80" % sid)],
+        [("📄 لاگ بازی (۳۰ خط)", "lg:%s:g30" % sid), ("📄 لاگ بازی (۸۰ خط)", "lg:%s:g80" % sid)],
+        [("🚪 ورود/خروج بازیکنان", "lg:%s:h20" % sid)],
+        [("↩️ بازگشت", "s:%s" % sid)],
+    ])
+
+
+def log_view(s, opt):
+    m = re.fullmatch(r"(c|g|h)(\d+)", opt or "")
+    if not m:
+        return "گزینه‌ی نامعتبر."
+    kind, n = m.group(1), int(m.group(2))
+    path = s.get("path", "") or ""
+    nm = srv_name(s)
+    if kind == "c":
+        txt = tail_file(os.path.join(path, "logs", "console.log"), n)
+        if txt is None:
+            return ("❌ فایل کنسول پیدا نشد.\n(مسیر: <code>%s/logs/console.log</code> — این فایل "
+                    "توسط tmux pipe-pane نوشته می‌شود؛ بعد از یک استارت کامل دوباره امتحان کنید.)" % esc(path))
+        return ("🖥 <b>کنسول «%s»</b> — آخرین %d خط:\n<pre>%s</pre>" % (esc(nm), n, esc(txt or "(خالی)")))
+    if kind == "g":
+        files = gamelog_files(path, 1)
+        if not files:
+            return ("❌ هنوز لاگ بازی ثبت نشده است.\n(مسیر: <code>%s/game/csgo/logs</code> — "
+                    "لاگ‌برداری به‌صورت خودکار روشن است؛ بعد از یک ری‌استارت دوباره امتحان کنید.)" % esc(path))
+        txt = tail_file(files[0], n)
+        return ("📄 <b>لاگ بازی «%s»</b> — %s (آخرین %d خط):\n<pre>%s</pre>" %
+                (esc(nm), esc(os.path.basename(files[0])), n, esc(txt or "(خالی)")))
+    evs = history_events(path, n)
+    if not evs:
+        return "🚪 هنوز رویداد ورود/خروجی ثبت نشده است."
+    lines = ["🚪 <b>ورود/خروج «%s»</b> (جدیدترین در بالا):" % esc(nm), ""]
+    for when, ev, who in reversed(evs):
+        lines.append("%s %s — %s" % ("🟢" if ev == "entered the game" else "🔴", when, esc(who)))
+    return "\n".join(lines)
+
+
+def dates_view(sid):
+    d = srv_dates(sid)
+    L = ["🗓 <b>تاریخ‌های سرور #%s</b>" % sid, ""]
+    L.append("🛒 زمان خرید: %s" % (d.get("buy") or "— ثبت نشده —"))
+    L.append("⏰ زمان تمدید: %s" % (d.get("exp") or "— ثبت نشده —"))
+    if d.get("exp"):
+        L.append("وضعیت: %s %s" % (day_icon(d["exp"]), fmt_days(d["exp"])))
+    L.append("")
+    L.append("برای ثبت: تاریخ را با فرمت <code>2026-05-30</code> بفرستید، یا <code>+30</code> "
+             "یعنی ۳۰ روز از امروز.")
+    rows = [
+        [("⏰ تنظیم/تغییر تمدید", "dt:%s:exp" % sid), ("🛒 تنظیم/تغییر خرید", "dt:%s:buy" % sid)],
+        [("🗑 پاک کردن هر دو", "dt:%s:clr" % sid)],
+        [("↩️ بازگشت", "s:%s" % sid)],
+    ]
+    return "\n".join(L), kb(rows)
+
+
+ACT_LABELS = {
+    "start": "▶️ استارت",
+    "stop": "⏹ استاپ",
+    "restart": "🔄 ری‌استارت",
+    "backup": "🗄 بکاپ",
+    "sync": "🔃 سینک پلاگین‌ها",
+    "doctor": "🩺 بررسی سلامت",
+}
+
+
+def tools_text(sid):
+    return ("🛠 <b>ابزارهای سرور #%s</b>\n\n"
+            "• استاپ و ری‌استارت قبل از اجرا تایید می‌گیرند.\n"
+            "• «پیام به بازیکنان» متن شما را با say داخل سرور می‌فرستد." % sid)
+
+
+def tools_kb(sid):
+    return kb([
+        [("▶️ استارت", "tl:%s:start" % sid), ("⏹ استاپ", "tl:%s:stop" % sid),
+         ("🔄 ری‌استارت", "tl:%s:restart" % sid)],
+        [("💬 پیام به بازیکنان", "tl:%s:say" % sid)],
+        [("🗄 بکاپ", "tl:%s:backup" % sid), ("🔃 سینک پلاگین‌ها", "tl:%s:sync" % sid),
+         ("🩺 بررسی سلامت", "tl:%s:doctor" % sid)],
+        [("↩️ بازگشت", "s:%s" % sid)],
+    ])
+
+
+def sysinfo_view():
+    ss = servers_list()
+    on = sum(1 for s in ss if s.get("status") == "ONLINE")
+    l1, l2, l3 = os.getloadavg()
+    memtot = memavail = None
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    memtot = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    memavail = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    ram = ("%d%%" % ((memtot - memavail) * 100 // memtot)) if (memtot and memavail is not None) else "?"
+    up = None
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as f:
+            up = fmt_uptime(float(f.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        pass
+    du = shutil.disk_usage(os.path.dirname(CFG["servers_json"]) or "/opt")
+    lines = [
+        "ℹ️ <b>وضعیت سیستم</b>",
+        "هاست: <code>%s</code>" % esc(socket.gethostname()),
+        "IP: <code>%s</code>" % primary_ip(),
+        "آپ‌تایم سرور: %s" % esc(up or "?"),
+        "سرورها: %d عدد (%d روشن)" % (len(ss), on),
+        "بار سیستم: %.2f / %.2f / %.2f" % (l1, l2, l3),
+        "RAM مصرفی: %s" % ram,
+        "دیسک: %d%% پر (%.1f گیگابایت آزاد)" % (round(du.used * 100 / du.total), du.free / 2**30),
+    ]
+    return "\n".join(lines)
+
+
+def expiry_view():
+    ss = servers_list()
+    if not ss:
+        return "سروری ثبت نشده است."
+    items = []
+    for s in ss:
+        d = srv_dates(s.get("id"))
+        exp = d.get("exp")
+        dl = days_left(exp) if exp else None
+        items.append((dl, s, exp))
+    items.sort(key=lambda x: (x[0] is None, x[0] if x[0] is not None else 0))
+    lines = ["🗓 <b>زمان تمدید سرورها</b>", ""]
+    for dl, s, exp in items:
+        nm = esc(srv_name(s))
+        if not exp:
+            lines.append("⚪️ %s — تمدید ثبت نشده" % nm)
+        else:
+            lines.append("%s %s — %s (%s)" % (day_icon(exp), nm, exp, fmt_days(exp)))
+    lines += ["", "برای تنظیم تاریخ: وارد پنل سرور شوید → 🗓 تاریخ‌ها"]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+#  Actions (start / stop / restart / say / backup / sync / doctor)             #
+# --------------------------------------------------------------------------- #
+
+ACT_TIMEOUT = {"start": 300, "stop": 300, "restart": 420,
+               "backup": 1800, "sync": 900, "doctor": 1800}
+
+
+def run_action(chat_id, sid, action):
+    label = ACT_LABELS.get(action, action)
+    args = [action, sid]
+    rc, out, err = nexus(args, ACT_TIMEOUT.get(action, 300))
+    txt = (out.strip() + ("\n" + err.strip() if err.strip() else "")).strip()
+    icon = "✅" if rc == 0 else "❌"
+    tail = txt[-1500:]
+    send(chat_id, "%s <b>%s</b> (سرور #%s)\n%s" %
+         (icon, label, sid, ("<code>%s</code>" % esc(tail)) if tail else "(بدون خروجی)"))
+    t, k, _ = panel_view(sid)
+    show_panel(chat_id, t, k)
+
+
+def do_say(chat_id, sid, text):
+    text = re.sub(r"[\r\n\t]+", " ", text).strip()[:380]
+    if not text:
+        send(chat_id, "❌ متن پیام خالی بود؛ ارسال نشد.")
+        return
+    rc, out, err = nexus(["say", sid, text], 90)
+    if rc == 0:
+        send(chat_id, "✅ پیام به سرور #%s ارسال شد: «%s»" % (sid, esc(text)))
+    else:
+        send(chat_id, "❌ ارسال پیام ناموفق بود:\n<code>%s</code>" %
+             esc((err.strip() or out.strip() or "خطای نامشخص")[-500:]))
+    t, k, _ = panel_view(sid)
+    show_panel(chat_id, t, k)
+
+
+# --------------------------------------------------------------------------- #
+#  Expiry watchdog                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def check_expiry_once():
+    ss = servers_list()
+    today = today_local().isoformat()
+    warn = int(CFG["expiry_warn_days"])
+    for s in ss:
+        try:
+            sid = int(s.get("id"))
+        except (TypeError, ValueError):
+            continue
+        iso = srv_dates(sid).get("exp")
+        if not iso:
+            continue
+        dl = days_left(iso)
+        if dl is None or dl > warn or dl < -14:
+            continue
+        key = "exp:%s:%s" % (sid, today)
+        if warned_get(key):
+            continue
+        state = ("⛔️ منقضی شده" if dl < 0 else
+                 ("🔴 امروز آخرین روز است" if dl == 0 else "🟠 %d روز مانده" % dl))
+        msg = ("⏰ <b>هشدار تمدید سرور</b>\n\n"
+               "🎮 %s (شناسه %s)\n"
+               "⏰ تاریخ تمدید: %s\n"
+               "وضعیت: %s\n"
+               "%s"
+               % (esc(srv_name(s)), sid, iso, state,
+                  "" if dl >= 0 else "\nتا تمدید شدن، سرور ممکن است خاموش شود."))
+        for a in CFG["admin_ids"]:
+            send(a, msg, kb([[("🎮 نمایش سرور", "s:%d" % sid)]]))
+        warned_mark(key, today)
+        log.info("expiry warning sent for server %s (%s days left)", sid, dl)
+
+
+def expiry_loop():
+    while True:
+        try:
+            check_expiry_once()
+        except Exception:
+            log.exception("expiry check failed")
+        time.sleep(1800)
+
+
+# --------------------------------------------------------------------------- #
+#  Update handling                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def on_message(msg):
+    chat = (msg.get("chat") or {}).get("id")
+    uid = (msg.get("from") or {}).get("id")
+    text = (msg.get("text") or "").strip()
+    if not chat or not uid:
+        return
+    if uid not in CFG["admin_ids"]:
+        if text.startswith("/id"):
+            send(chat, "شناسه تلگرام شما: <code>%s</code>\nاین شناسه را به مدیر بدهید تا "
+                       "در لیست مجازها ثبت شود." % uid)
+        else:
+            send(chat, "⛔️ شما مجاز به استفاده از این ربات نیستید.\n"
+                       "شناسه تلگرام شما: <code>%s</code>" % uid)
+        return
+
+    if text in ("/start", "/menu"):
+        PENDING.pop(chat, None)
+        show_panel(chat, main_text(), kb(KB_HOME))
+        return
+    if text == "/help":
+        show_panel(chat, help_text(), kb([[("🏠 منوی اصلی", "home")]]))
+        return
+    if text == "/id":
+        send(chat, "شناسه تلگرام شما: <code>%s</code>" % uid)
+        return
+    if text == "/cancel":
+        if PENDING.pop(chat, None):
+            send(chat, "لغو شد. ↩️")
+        else:
+            send(chat, "چیزی برای لغو نبود.")
+        return
+
+    p = PENDING.get(chat)
+    if p:
+        if p["k"] == "date":
+            iso = parse_date_input(text)
+            if iso is None:
+                send(chat, "❌ فرمت درست نیست.\nمثال‌ها: <code>2026-05-30</code> یا <code>+30</code> "
+                           "(۳۰ روز از امروز) یا <code>/cancel</code>")
+                return
+            srv_dates_set(p["sid"], p["field"], iso)
+            PENDING.pop(chat, None)
+            what = "زمان تمدید" if p["field"] == "exp" else "زمان خرید"
+            send(chat, "✅ %s سرور #%s روی <code>%s</code> ثبت شد." % (what, p["sid"], iso))
+            t, k = dates_view(p["sid"])
+            show_panel(chat, t, k)
+        elif p["k"] == "say":
+            PENDING.pop(chat, None)
+            do_say(chat, p["sid"], text)
+        return
+    send(chat, "برای شروع /start را بزنید یا از دکمه‌های منو استفاده کنید.")
+
+
+def on_callback(cb):
+    cb_id = cb.get("id")
+    uid = (cb.get("from") or {}).get("id")
+    msg = cb.get("message") or {}
+    chat = (msg.get("chat") or {}).get("id")
+    data = cb.get("data") or ""
+    admin = uid in CFG["admin_ids"]
+    try:
+        payload = {"callback_query_id": cb_id}
+        if not admin:
+            payload.update({"text": "⛔️ دسترسی ندارید", "show_alert": True})
+        tg("answerCallbackQuery", payload, timeout=15)
+    except TgError as e:
+        log.info("answerCallbackQuery failed: %s", e)
+    if not admin or not chat:
+        return
+    if msg.get("message_id"):
+        PANEL[chat] = msg["message_id"]
+    PENDING.pop(chat, None)
+
+    try:
+        route(chat, data)
+    except Exception:
+        log.exception("callback routing failed for %r", data)
+        send(chat, "❌ خطای داخلی در پردازش درخواست؛ لطفاً دوباره امتحان کنید.")
+
+
+def route(chat, data):
+    parts = data.split(":")
+    head = parts[0]
+    sid = None
+    if len(parts) > 1 and head in ("s", "lg", "dt", "tl", "cfm"):
+        try:
+            sid = str(int(parts[1]))
+        except ValueError:
+            return
+    if head == "home":
+        show_panel(chat, main_text(), kb(KB_HOME))
+    elif head == "help":
+        show_panel(chat, help_text(), kb([[("🏠 منوی اصلی", "home")]]))
+    elif head == "srvs":
+        t, k = servers_view()
+        show_panel(chat, t, k)
+    elif head == "sys":
+        show_panel(chat, sysinfo_view(), kb([[("🔄 بروزرسانی", "sys")],
+                                             [("🏠 منوی اصلی", "home")]]))
+    elif head == "exp":
+        show_panel(chat, expiry_view(), kb([[("🔄 بروزرسانی", "exp")],
+                                            [("🏠 منوی اصلی", "home")]]))
+    elif head == "s":
+        if len(parts) == 2 or (len(parts) > 2 and parts[2] == "rf"):
+            t, k, _ = panel_view(sid)
+            show_panel(chat, t, k)
+        elif len(parts) > 2 and parts[2] == "p":
+            s = server_one(sid) or {"id": sid, "status": "OFFLINE", "path": ""}
+            send(chat, players_view(s))
+        elif len(parts) > 2 and parts[2] == "lg":
+            show_panel(chat, logs_menu_text(sid), logs_menu_kb(sid))
+        elif len(parts) > 2 and parts[2] == "dt":
+            t, k = dates_view(sid)
+            show_panel(chat, t, k)
+        elif len(parts) > 2 and parts[2] == "tl":
+            show_panel(chat, tools_text(sid), tools_kb(sid))
+    elif head == "lg":
+        s = server_one(sid) or {"id": sid, "name": "#%s" % sid, "path": ""}
+        send(chat, log_view(s, parts[2] if len(parts) > 2 else ""))
+    elif head == "dt":
+        act = parts[2] if len(parts) > 2 else ""
+        if act == "clr":
+            srv_dates_set(sid, "exp", None)
+            srv_dates_set(sid, "buy", None)
+            send(chat, "🗑 تاریخ‌های سرور #%s پاک شدند." % sid)
+        else:
+            PENDING[chat] = {"k": "date", "sid": sid, "field": act}
+            what = "زمان تمدید" if act == "exp" else "زمان خرید"
+            send(chat, "🗓 <b>%s سرور #%s</b>\n\nتاریخ را بفرستید:\n"
+                       "• فرمت دقیق: <code>2026-05-30</code>\n"
+                       "• یا تعداد روز از امروز: <code>+30</code>\n"
+                       "• لغو: <code>/cancel</code>" % (what, sid))
+        t, k = dates_view(sid)
+        show_panel(chat, t, k)
+    elif head == "tl":
+        act = parts[2] if len(parts) > 2 else ""
+        if act == "say":
+            PENDING[chat] = {"k": "say", "sid": sid}
+            send(chat, "💬 متن پیام به بازیکنان سرور #%s را بفرستید (حداکثر ۳۸۰ کاراکتر) "
+                       "یا /cancel" % sid)
+        elif act in ("stop", "restart"):
+            send(chat, "⚠️ مطمئنید می‌خواهید سرور #%s <b>%s</b> شود؟" %
+                 (sid, "خاموش" if act == "stop" else "ری‌استارت"),
+                 kb([[("✅ بله، انجام بده", "cfm:%s:%s" % (sid, act)),
+                      ("❌ خیر", "s:%s" % sid)]]))
+        else:
+            send(chat, "⏳ %s در حال اجرا است؛ چند لحظه صبر کنید..." % ACT_LABELS.get(act, act))
+            run_action(chat, sid, act)
+    elif head == "cfm":
+        act = parts[2] if len(parts) > 2 else ""
+        if act in ACT_LABELS:
+            run_action(chat, sid, act)
+
+
+# --------------------------------------------------------------------------- #
+#  Main loop                                                                  #
+# --------------------------------------------------------------------------- #
+
+RUNNING = True
+
+
+def _sigterm(_sig, _frm):
+    global RUNNING
+    RUNNING = False
+
+
+def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT, _sigterm)
+
+    token = CFG["bot_token"]
+    if not token or "PASTE" in token.upper() or "TOKEN" in token.upper():
+        log.error("Telegram token not found. Put bot_token in %s, or set ALERT_TG_TOKEN in %s.",
+                  CONFIG_PATH, CFG["features_conf"])
+        sys.exit(1)
+    if not CFG["admin_ids"]:
+        log.warning("No admin IDs configured! Nobody can use the menu. Set admin_ids in %s "
+                    "or ALERT_TG_CHAT / ALERT_TG_CHAT2 in %s.",
+                    CONFIG_PATH, CFG["features_conf"])
+
+    try:
+        me = tg("getMe", timeout=20)
+    except TgError as e:
+        log.error("getMe failed (token/proxy/network?): %s | api_base=%s", e, CFG["api_base"])
+        sys.exit(1)
+    log.info("Bot @%s started | api_base=%s | admins=%s | nexus=%s",
+             me.get("username"), CFG["api_base"], CFG["admin_ids"], CFG["nexus_sh"])
+
+    threading.Thread(target=expiry_loop, daemon=True).start()
+
+    offset = 0
+    while RUNNING:
+        try:
+            ups = tg("getUpdates",
+                     {"offset": offset, "timeout": int(CFG["poll_timeout"]),
+                      "allowed_updates": ["message", "callback_query"]},
+                     timeout=int(CFG["poll_timeout"]) + 15)
+            for u in ups or []:
+                offset = u["update_id"] + 1
+                try:
+                    if "message" in u and u["message"]:
+                        on_message(u["message"])
+                    elif "callback_query" in u and u["callback_query"]:
+                        on_callback(u["callback_query"])
+                except Exception:
+                    log.exception("update handling failed")
+        except TgError as e:
+            s = str(e).lower()
+            if "409" in s or "conflict" in s:
+                log.error("Another getUpdates consumer is running (409). "
+                          "Stop the other bot instance or this one.")
+                time.sleep(10)
+            else:
+                log.warning("getUpdates failed: %s", e)
+                time.sleep(5)
+    log.info("Bot stopped.")
+
+
+if __name__ == "__main__":
+    main()
+TG_BOT_PY_EOF_9F3A
+}
+
+_tgbot_config_template() {
+    cat <<'TG_BOT_CFG_EOF_9F3A'
+{
+  "_hint": "in hati ekhtiyari ast. agar bot_token va admin_ids ra khali begozarid, robot khodash token va 2 shenase ra az nexus-features.conf (ALERT_TG_TOKEN / ALERT_TG_CHAT / ALERT_TG_CHAT2) mikhanad.",
+  "bot_token": "",
+  "admin_ids": [],
+  "api_base": "",
+  "proxy_key": "",
+  "nexus_sh": "/opt/nexus.sh",
+  "features_conf": "/opt/cs2-servers/shared/nexus-features.conf",
+  "servers_json": "/opt/cs2-servers/servers.json",
+  "csgo_user": "cs2",
+  "tz_offset_min": 210,
+  "expiry_warn_days": 7,
+  "poll_timeout": 25,
+  "player_query_wait": 2.0
+}
+TG_BOT_CFG_EOF_9F3A
+}
+
+_tgbot_unit_template() {
+    cat <<'TG_BOT_UNIT_EOF_9F3A'
+[Unit]
+Description=CS2Nexus Telegram Bot (admin menu for nexus.sh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/cs2nexus-tgbot/cs2nexus_tgbot.py
+WorkingDirectory=/opt/cs2nexus-tgbot
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+TG_BOT_UNIT_EOF_9F3A
+}
+
+tgbot_cmd_check() {
+    command -v python3 >/dev/null 2>&1 || { err "python3 is required for the Telegram bot."; return 1; }
+    command -v systemctl >/dev/null 2>&1 || { err "systemd (systemctl) is required for the Telegram bot."; return 1; }
+    return 0
+}
+
+tgbot_installed() { [[ -f $TG_UNIT && -f $TG_DIR/cs2nexus_tgbot.py ]]; }
+
+tgbot_write_files() {
+    tgbot_cmd_check || return 1
+    install -d -m 700 -- "$TG_DIR" || { err "Cannot create $TG_DIR"; return 1; }
+    if ! _tgbot_python_payload >"$TG_DIR/cs2nexus_tgbot.py"; then err "Cannot write the bot script."; return 1; fi
+    chmod 700 -- "$TG_DIR/cs2nexus_tgbot.py"
+    if ! python3 -m py_compile -- "$TG_DIR/cs2nexus_tgbot.py" >/dev/null 2>&1; then
+        err "The embedded bot script did not compile (python3 too old?)."
+        return 1
+    fi
+    if [[ ! -f $TG_DIR/config.json ]]; then
+        _tgbot_config_template >"$TG_DIR/config.json" && chmod 600 -- "$TG_DIR/config.json"
+    fi
+    _tgbot_unit_template >"$TG_UNIT" || { err "Cannot write $TG_UNIT"; return 1; }
+    return 0
+}
+
+tgbot_show_ids() {
+    local tok key c1 c2 cfg_tok=""
+    tok=$(fx_get ALERT_TG_TOKEN)
+    key=$(fx_get ALERT_TG_PROXY_KEY)
+    c1=$(fx_get ALERT_TG_CHAT)
+    c2=$(fx_get ALERT_TG_CHAT2)
+    [[ -f $TG_DIR/config.json ]] && cfg_tok=$(jq -r '.bot_token // ""' "$TG_DIR/config.json" 2>/dev/null)
+    echo "  nexus-features.conf: $FX_FILE"
+    if [[ -n $tok ]]; then printf '  ALERT_TG_TOKEN     : %s...\n' "${tok:0:10}"
+    else echo "  ALERT_TG_TOKEN     : (empty)"; fi
+    printf '  ALERT_TG_PROXY_KEY : %s\n' "${key:-(empty)}"
+    printf '  ALERT_TG_CHAT      : %s\n' "${c1:-(empty)}"
+    printf '  ALERT_TG_CHAT2     : %s\n' "${c2:-(empty)}"
+    if [[ -n $cfg_tok && $cfg_tok != null ]]; then
+        printf '  config.json bot_token : %s...  (overrides the value above)\n' "${cfg_tok:0:10}"
+    fi
+    echo "  These 2 chat IDs (or admin_ids in $TG_DIR/config.json) get the full bot menu."
+}
+
+tgbot_install() {
+    tgbot_cmd_check || return 1
+    tgbot_write_files || return 1
+    systemctl daemon-reload 2>/dev/null || true
+    if ! systemctl enable --now "$TG_SVC" >/dev/null 2>&1; then
+        systemctl enable --now "$TG_SVC" || { err "Could not enable $TG_SVC."; return 1; }
+    fi
+    sleep 2
+    ok "Telegram bot installed and started (service: $TG_SVC, files: $TG_DIR)."
+    tgbot_show_ids
+    local tok cfg_tok
+    tok=$(fx_get ALERT_TG_TOKEN)
+    cfg_tok=$(jq -r '.bot_token // ""' "$TG_DIR/config.json" 2>/dev/null || true)
+    if [[ -z $tok && ( -z $cfg_tok || $cfg_tok == null || $cfg_tok == *PASTE* ) ]]; then
+        warn "No Telegram token yet: set ALERT_TG_TOKEN in $FX_FILE (or bot_token in $TG_DIR/config.json), then Restart."
+    fi
+    info "Open Telegram and send /start to your bot to see the admin menu."
+    return 0
+}
+
+tgbot_uninstall() {
+    systemctl disable --now "$TG_SVC" >/dev/null 2>&1 || true
+    rm -f -- "$TG_UNIT" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ -t 0 ]] && confirm_yn "Also delete the bot files in $TG_DIR (incl. data.json with the renewal dates)? [y/N]: " n; then
+        rm -rf --one-file-system -- "$TG_DIR" 2>/dev/null || true
+        ok "Telegram bot removed completely."
+    else
+        ok "Service removed. Files kept in $TG_DIR."
+    fi
+    return 0
+}
+
+tgbot_action() {
+    local a=${1:-}
+    case $a in
+        start|stop|restart)
+            tgbot_installed || { err "Not installed. Run: $SELF tgbot install"; return 1; }
+            systemctl "$a" "$TG_SVC" && ok "Telegram bot: $a OK." \
+                || { err "systemctl $a $TG_SVC failed (see: journalctl -u $TG_SVC)."; return 1; } ;;
+        status)
+            tgbot_installed || { err "Not installed. Run: $SELF tgbot install"; return 1; }
+            systemctl --no-pager --lines=8 status "$TG_SVC" ;;
+        logs)
+            tgbot_installed || { err "Not installed. Run: $SELF tgbot install"; return 1; }
+            if [[ -t 0 ]]; then journalctl -u "$TG_SVC" -n 50 -f
+            else journalctl -u "$TG_SVC" -n 100 --no-pager; fi ;;
+        *) err "Unknown tgbot action: $a"; return 2 ;;
+    esac
+}
+
+tgbot_edit_config() {
+    [[ -f $TG_DIR/config.json ]] || { tgbot_write_files || return 1; }
+    if command -v nano >/dev/null 2>&1; then nano "$TG_DIR/config.json"
+    elif command -v vi >/dev/null 2>&1; then vi "$TG_DIR/config.json"
+    else err "No editor found (nano/vi). Edit $TG_DIR/config.json by hand."; return 1; fi
+    if tgbot_installed; then
+        systemctl restart "$TG_SVC" && ok "Config saved; bot restarted."
+    fi
+    return 0
+}
+
+tgbot_menu() {
+    local choice
+    while :; do
+        clear_screen
+        header "TELEGRAM BOT"
+        echo "  Persian admin bot for Telegram: server list, players inside a server,"
+        echo "  logs, purchase/renewal dates + expiry warnings, start/stop/restart."
+        echo "  Only the 2 admin chats have access."
+        echo
+        if tgbot_installed; then
+            printf '  Service : %s (%s)\n' "$TG_SVC" "$(systemctl is-active "$TG_SVC" 2>/dev/null || echo unknown)"
+            printf '  Files   : %s\n' "$TG_DIR"
+        else
+            echo "  Status  : not installed yet"
+        fi
+        echo
+        echo " 1) Install / Reinstall (files + systemd service + start)"
+        echo " 2) Start"
+        echo " 3) Stop"
+        echo " 4) Restart"
+        echo " 5) Status"
+        echo " 6) Live logs (Ctrl+C to go back)"
+        echo " 7) Edit config.json (token / admin IDs)"
+        echo " 8) Show token & admin IDs (from nexus-features.conf)"
+        echo " 9) Remove the bot"
+        echo " q) Back"
+        echo
+        read -r -p "Select: " choice || exit 0
+        case "$(trim "$choice")" in
+            1) tgbot_install;        pause ;;
+            2) tgbot_action start;   pause ;;
+            3) tgbot_action stop;    pause ;;
+            4) tgbot_action restart; pause ;;
+            5) tgbot_action status;  pause ;;
+            6) tgbot_action logs ;;
+            7) tgbot_edit_config;    pause ;;
+            8) tgbot_show_ids;       pause ;;
+            9) tgbot_uninstall;      pause ;;
+            q|Q) return 0 ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+cli_tgbot() {
+    local action=${1:-}
+    case $action in
+        install)   tgbot_install ;;
+        uninstall) tgbot_uninstall ;;
+        start|stop|restart|status) tgbot_action "$action" ;;
+        logs)
+            tgbot_installed || { err "Not installed. Run: $SELF tgbot install"; return 1; }
+            journalctl -u "$TG_SVC" -n 100 --no-pager ;;
+        *)
+            err "Usage: $SELF tgbot install|start|stop|restart|status|logs|uninstall"
+            return 2 ;;
+    esac
+}
+
+
 main_menu() {
     local choice
     while :; do
@@ -6802,7 +8244,8 @@ main_menu() {
         echo "15) Resource Monitor (CPU / RAM / disk, live)"
         echo "16) Web Panel (players' website)"
         echo "17) Server Doctor (check, lighten & repair everything)"
-        echo "18) Exit"
+        echo "18) Telegram Bot (admin bot for the 2 admin chats)"
+        echo "19) Exit"
         echo
         read -r -p "Select: " choice || exit 0
         case "$(trim "$choice")" in
@@ -6823,7 +8266,8 @@ main_menu() {
             15) monitor_ui ;;
             16) panel_menu ;;
             17) doctor_ui;        pause ;;
-            18|q|Q) clear_screen; echo "Goodbye."; exit 0 ;;
+            18) tgbot_menu ;;
+            19|q|Q) clear_screen; echo "Goodbye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
     done
@@ -9901,6 +11345,7 @@ Usage: $SELF [command]
   sync [--dry-run]          register plugins dropped in the shared folders and sync all servers
   say ID MESSAGE...         send "say MESSAGE" to one running server
   broadcast MESSAGE...      send "say MESSAGE" to every running server
+  tgbot ACTION              built-in Telegram bot: install, start, stop, restart, status, logs, uninstall
   watchdog                  start offline autostart servers (used by the timer)
   plugin-update             update plugins installed from the Plugin Browser (used by the timer)
   css-update                update official CounterStrikeSharp release (used by the timer)
@@ -10037,6 +11482,7 @@ cli_main() {
         sync)      preflight cli; cli_sync "$@" ;;
         say)       preflight cli; cli_say "$@" ;;
         broadcast) preflight cli; cli_broadcast "$@" ;;
+        tgbot)     preflight cli; cli_tgbot "$@" ;;
         watchdog)  preflight cli; watchdog_run ;;
         plugin-update) preflight cli; plugins_update_run 1 ;;
         css-update) preflight cli; css_update_run 1 ;;
