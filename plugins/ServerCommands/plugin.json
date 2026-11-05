@@ -1,8 +1,8 @@
 {
   "name": "ServerCommands",
-  "version": "4.1.0",
+  "version": "4.3.0",
   "author": "NEPENTII / CS2Nexus",
-  "description": "Central admin plugin: admin commands with menus, admin tags (| ADMIN | name), gag/mute, real per-server bans, match flow, game modes.",
+  "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes (native Competitive kept — no game_type/game_mode/changelevel). VIP: /addvip and /vip (NexusVIP levels; VIP chat tag and color via NexusVIP flags).",
   "commands": [
     {
       "name": "rr",
@@ -429,6 +429,18 @@
       "name": "sc_reload",
       "description": "Reload admins written by the launcher (server console only)",
       "usage": "css_sc_reload",
+      "aliases": []
+    },
+    {
+      "name": "addvip",
+      "description": "Add or update a Normal VIP (NexusVIP).",
+      "usage": "/addvip [name]&<steamid64> <bronze|silver|gold|platinum|1-4> [days]",
+      "aliases": []
+    },
+    {
+      "name": "vip",
+      "description": "List the Normal VIP players of this server.",
+      "usage": "/vip",
       "aliases": []
     }
   ],

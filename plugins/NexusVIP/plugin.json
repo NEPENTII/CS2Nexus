@@ -1,0 +1,13 @@
+{
+  "name": "NexusVIP",
+  "version": "0.4.0",
+  "author": "CS2Nexus",
+  "description": "Per-server Normal VIP (Bronze..Platinum). Owner and admins with the addvip permission grant levels; VIP gives VIP chat, !vipinfo, !vipmenu and VoteKick via ServerCommands.",
+  "commands": [
+    { "name": "addvip", "description": "Owner: grant or update a Normal VIP.", "usage": "!addvip [name]&<steamid64> <level> [days]", "aliases": [] },
+    { "name": "vip", "description": "Owner: list the Normal VIP players of this server.", "usage": "!vip", "aliases": [] },
+    { "name": "vipinfo", "description": "Show your own VIP level and expiry.", "usage": "!vipinfo", "aliases": [] },
+    { "name": "vipmenu", "description": "Show all VIP features and which ones you have.", "usage": "!vipmenu", "aliases": [] }
+  ],
+  "configs": [ "NexusVIP.json" ]
+}

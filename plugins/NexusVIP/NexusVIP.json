@@ -1,0 +1,8 @@
+{
+  "OwnerFlags": [ "@css/root" ],
+  "DefaultDays": 30,
+  "MaxDays": 3650,
+  "VipListLimit": 20,
+  "ServerCommandsBridge": true,
+  "ServerCommandsFlagPrefix": "@nepentii/"
+}
