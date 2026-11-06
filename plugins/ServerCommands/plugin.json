@@ -1,8 +1,8 @@
 {
   "name": "ServerCommands",
-  "version": "4.3.0",
+  "version": "5.0.0",
   "author": "NEPENTII / CS2Nexus",
-  "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes (native Competitive kept — no game_type/game_mode/changelevel). VIP: /addvip and /vip (NexusVIP levels; VIP chat tag and color via NexusVIP flags).",
+  "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes, plus the built-in VIP system (merged NexusVIP): !addvip, !vip, !vipmenu, !vipinfo, !g gun menu, smoke/chat colors, VIP votes.",
   "commands": [
     {
       "name": "rr",
@@ -441,6 +441,66 @@
       "name": "vip",
       "description": "List the Normal VIP players of this server.",
       "usage": "/vip",
+      "aliases": []
+    },
+    {
+      "name": "vipinfo",
+      "description": "Show your own VIP level and expiry on this server.",
+      "usage": "/vipinfo",
+      "aliases": []
+    },
+    {
+      "name": "vipmenu",
+      "description": "VIP menu: chat/name/smoke color, VIP tag, features.",
+      "usage": "/vipmenu",
+      "aliases": []
+    },
+    {
+      "name": "g",
+      "description": "VIP gun menu.",
+      "usage": "/g",
+      "aliases": []
+    },
+    {
+      "name": "vc",
+      "description": "VIP-only private chat.",
+      "usage": "/vc <message>",
+      "aliases": []
+    },
+    {
+      "name": "vjoin",
+      "description": "Set your VIP join message.",
+      "usage": "/vjoin <message>",
+      "aliases": []
+    },
+    {
+      "name": "vleave",
+      "description": "Set your VIP leave message.",
+      "usage": "/vleave <message>",
+      "aliases": []
+    },
+    {
+      "name": "vprefix",
+      "description": "Set your VIP chat prefix (Silver+).",
+      "usage": "/vprefix <prefix>",
+      "aliases": []
+    },
+    {
+      "name": "vmute",
+      "description": "VIP vote: mute a player's chat.",
+      "usage": "/vmute <player>",
+      "aliases": []
+    },
+    {
+      "name": "vban",
+      "description": "VIP vote: temporarily ban a player.",
+      "usage": "/vban <player>",
+      "aliases": []
+    },
+    {
+      "name": "vmap",
+      "description": "VIP vote: change map.",
+      "usage": "/vmap <map>",
       "aliases": []
     }
   ],
