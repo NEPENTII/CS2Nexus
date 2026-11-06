@@ -1,6 +1,6 @@
 {
   "name": "ServerCommands",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "author": "NEPENTII / CS2Nexus",
   "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes, plus the built-in VIP system (merged NexusVIP): !addvip, !vip, !vipmenu, !vipinfo, !g gun menu, smoke/chat colors, VIP votes.",
   "commands": [
@@ -501,6 +501,18 @@
       "name": "vmap",
       "description": "VIP vote: change map.",
       "usage": "/vmap <map>",
+      "aliases": []
+    },
+    {
+      "name": "vpoints",
+      "description": "Show your VIP points.",
+      "usage": "/vpoints",
+      "aliases": []
+    },
+    {
+      "name": "vtop",
+      "description": "VIP points leaderboard.",
+      "usage": "/vtop",
       "aliases": []
     }
   ],
