@@ -1,8 +1,8 @@
 {
   "name": "ServerCommands",
-  "version": "5.2.1",
+  "version": "5.4.0",
   "author": "NEPENTII / CS2Nexus",
-  "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes, plus the built-in VIP system (merged NexusVIP): !addvip, !vip, !vipmenu, !vipinfo, !g gun menu, smoke/chat colors, VIP votes.",
+  "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes, plus the built-in VIP system (merged NexusVIP): !addvip, !vip, !vipmenu, !vipinfo, !g gun menu, smoke/chat colors, VIP votes - and the owner-grade VIP manager (!vipmanage): add/edit/upgrade/downgrade/extend/remove/info, AdminManage per-admin VIP permissions, full audit trail.",
   "commands": [
     {
       "name": "rr",
@@ -513,6 +513,24 @@
       "name": "vtop",
       "description": "VIP points leaderboard.",
       "usage": "/vtop",
+      "aliases": []
+    },
+    {
+      "name": "vipmanage",
+      "description": "Open the VIP management menu (add/edit/upgrade/downgrade/extend/remove/info + owner AdminManage).",
+      "usage": "/vipmanage",
+      "aliases": []
+    },
+    {
+      "name": "days",
+      "description": "Custom day count for the pending VIP management operation.",
+      "usage": "/days <number>",
+      "aliases": []
+    },
+    {
+      "name": "find",
+      "description": "Target an offline SteamID64 for the pending VIP management operation.",
+      "usage": "/find <steamid64>",
       "aliases": []
     }
   ],
