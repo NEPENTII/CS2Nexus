@@ -1,8 +1,8 @@
 {
   "name": "ServerCommands",
-  "version": "5.4.0",
+  "version": "5.6.2",
   "author": "NEPENTII / CS2Nexus",
-  "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes, plus the built-in VIP system (merged NexusVIP): !addvip, !vip, !vipmenu, !vipinfo, !g gun menu, smoke/chat colors, VIP votes - and the owner-grade VIP manager (!vipmanage): add/edit/upgrade/downgrade/extend/remove/info, AdminManage per-admin VIP permissions, full audit trail.",
+  "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes, plus the built-in VIP system (VIP 1-5; VIP 5 adds 130 cosmetic effects: glow, auras, trails, spawn/kill/headshot/death/MVP/special-kill effects, floating cosmetics - !vfx) (merged NexusVIP): !addvip, !vip, !vipmenu, !vipinfo, !g gun menu, smoke/chat colors, VIP votes - and the owner-grade VIP manager (!vipmanage): add/edit/upgrade/downgrade/extend/remove/info, AdminManage per-admin VIP permissions, full audit trail. HealthShot policy: max one per player, no drop on death, gun menu and HealthShot locked during round 1 (open from round 2).",
   "commands": [
     {
       "name": "rr",
@@ -433,8 +433,8 @@
     },
     {
       "name": "addvip",
-      "description": "Add or update a Normal VIP (NexusVIP).",
-      "usage": "/addvip [name]&<steamid64> <bronze|silver|gold|platinum|1-4> [days]",
+      "description": "Add or update a VIP (levels VIP 1 - VIP 5).",
+      "usage": "/addvip [name]&<steamid64> <1-5|vip1-vip5> [days]",
       "aliases": []
     },
     {
@@ -532,11 +532,24 @@
       "description": "Target an offline SteamID64 for the pending VIP management operation.",
       "usage": "/find <steamid64>",
       "aliases": []
+    },
+    {
+      "name": "vfx",
+      "description": "VIP 5: effects menu (glow, auras, trails, kill/death/MVP effects...).",
+      "usage": "/vfx",
+      "aliases": []
+    },
+    {
+      "name": "vfxtest",
+      "description": "Admins: play VIP 5 effect <id> on yourself to check its particle.",
+      "usage": "/vfxtest <1-130>",
+      "aliases": []
     }
   ],
   "configs": [
     "configs/plugins/ServerCommands/ServerCommands.json",
     "configs/admins.json",
-    "configs/ServerCommandsAdmins.json"
+    "configs/ServerCommandsAdmins.json",
+    "configs/plugins/ServerCommands/vip_effects.json"
   ]
 }
