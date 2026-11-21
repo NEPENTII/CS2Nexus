@@ -6,7 +6,7 @@
   "AdminsCommandEnabled": true,
   "DefaultAdminTag": "ADMIN",
   "OwnerTag": "OWNER",
-  "TagPresets": ["OWNER", "ADMIN", "MOD", "HELPER"],
+  "TagPresets": ["OWNER", "ADMIN", "MOD", "HELPER", "VIP"],
   "NewAdminPermissions": ["plist", "kick", "gag", "ungag", "mute", "unmute", "map", "spectate", "slap", "slay", "respawn", "move", "admincmd", "votekick"],
   "NewAdminImmunity": 50,
   "ChatPrefix": "[Server]",
