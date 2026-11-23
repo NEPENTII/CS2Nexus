@@ -1,6 +1,6 @@
 {
   "name": "ServerCommands",
-  "version": "5.6.3",
+  "version": "5.6.5",
   "author": "NEPENTII / CS2Nexus",
   "description": "Central admin plugin: admin commands with menus, admin tags, gag/mute, real per-server bans, match flow, script-based game modes, plus the built-in VIP system (VIP 1-5; VIP 5 adds 130 cosmetic effects: glow, auras, trails, spawn/kill/headshot/death/MVP/special-kill effects, floating cosmetics - !vfx) (merged NexusVIP): !addvip, !vip, !vipmenu, !vipinfo, !g gun menu, smoke/chat colors, VIP votes - and the owner-grade VIP manager (!vipmanage): add/edit/upgrade/downgrade/extend/remove/info, AdminManage per-admin VIP permissions, full audit trail. HealthShot policy: max one per player, no drop on death, gun menu and HealthShot locked during round 1 (open from round 2).",
   "commands": [

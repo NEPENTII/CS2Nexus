@@ -46,3 +46,27 @@ are unchanged.
   - injected the 13-instruction guard at the start of `ShowAdmins`
 - Verified with Cecil: IL is in correct forward order, all call operands resolve,
   branch targets valid, 176 instructions (163 original + 13 guard).
+
+
+---
+
+## [NEXUS] global-owner tag patch (v5.6.5-nexus)
+
+This DLL is Cecil-patched on the v5.6.5 base so the **two global Nexus owners** show the
+protected `[NEXUS]` tag in-game (spec §14.1/14.2). Three in-place IL edits (no structural change,
+branch offsets recomputed by Cecil):
+
+1. **`ApplyTag` owner-branch** — the owner name prefix is now the hardcoded `ldstr "NEXUS"`,
+   wrapped by the existing `"[" + … + "] "` -> `"[NEXUS] "` (was `Config.OwnerTag`). Every
+   SteamID in `OwnerSteamIds` gets it; the launcher's `owners_ensure` puts only the two global
+   owners (`76561198768187147`, `76561198878431088`) there on every server.
+2. **`TagOf` owner-branch** — returns hardcoded `ldstr "[NEXUS]"` (was `Config.OwnerTag`), so the
+   `!admins` list shows `| [NEXUS] |` for owners.
+3. **`NexusNamePrefix` regex** — `^(?:nexus|\[ᴏᴡɴᴇʀ\])\s*` -> `^(?:nexus|\[ᴏᴡɴᴇʀ\]|\[NEXUS\])\s*`
+   so `StripPrefixes` strips a stale `[NEXUS] ` left in a player's name after a plugin reload
+   (no `[NEXUS] [NEXUS] name` stacking).
+
+`[NEXUS]` is **hardcoded** = protected: per-server `OwnerTag` config cannot override it, ordinary
+admins can't remove it, it survives restarts (baked into the DLL). The website strips all in-game
+tags from displayed names (`state.js dn()`), so `[NEXUS]` is in-game only — permissions are
+unchanged. The seed `ServerCommands.json` now lists both global owners in `OwnerSteamIds`.
